@@ -1181,6 +1181,11 @@ func (r *HostedClusterReconciler) reconcile(ctx context.Context, req ctrl.Reques
 		meta.SetStatusCondition(&hcluster.Status.Conditions, condition)
 	}
 
+	// Copy the configuration status from the hostedcontrolplane
+	if hcp != nil {
+		hcluster.Status.Configuration = hcp.Status.Configuration
+	}
+
 	// Persist status updates
 	if err := r.Client.Status().Update(ctx, hcluster); err != nil {
 		if apierrors.IsConflict(err) {
@@ -1394,19 +1399,14 @@ func (r *HostedClusterReconciler) reconcile(ctx context.Context, req ctrl.Reques
 				hclusterAnnotations := hcluster.GetAnnotations()
 				delete(hclusterAnnotations, hyperv1.HostedClusterRestoredFromBackupAnnotation)
 				hcluster.SetAnnotations(hclusterAnnotations)
-				_, err := createOrUpdate(ctx, r.Client, hcluster, func() error {
-					return nil
-				})
-				if err != nil {
+				if err := r.Client.Update(ctx, hcluster); err != nil {
 					return ctrl.Result{}, fmt.Errorf("failed to remove annotations %v: %w", string(hyperv1.HostedClusterRestoredFromBackup), err)
 				}
 			}
 
 			// Persist status updates
 			meta.SetStatusCondition(&hcluster.Status.Conditions, *freshCondition)
-			if _, err := createOrUpdate(ctx, r.Client, hcluster, func() error {
-				return nil
-			}); err != nil {
+			if err := r.Client.Status().Update(ctx, hcluster); err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to update status %v: %w", string(hyperv1.HostedClusterRestoredFromBackup), err)
 			}
 		}
@@ -2043,7 +2043,7 @@ func (r *HostedClusterReconciler) reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	if err := r.reconcileKarpenterOperator(cpContext, createOrUpdate, hcluster, hcp, r.HypershiftOperatorImage, controlPlaneOperatorImage); err != nil {
+	if err := r.reconcileKarpenterOperator(cpContext, createOrUpdate, hcluster, r.HypershiftOperatorImage, controlPlaneOperatorImage); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to reconcile karpenter operator: %w", err)
 	}
 
@@ -2220,6 +2220,7 @@ func reconcileHostedControlPlaneAnnotations(hcp *hyperv1.HostedControlPlane, hcl
 		hyperv1.KubeAPIServerGOMemoryLimitAnnotation,
 		hyperv1.RequestServingNodeAdditionalSelectorAnnotation,
 		hyperv1.AWSLoadBalancerSubnetsAnnotation,
+		hyperv1.AWSLoadBalancerTargetNodesAnnotation,
 		hyperv1.ManagementPlatformAnnotation,
 		hyperv1.KubeAPIServerVerbosityLevelAnnotation,
 		hyperv1.KubeAPIServerMaximumRequestsInFlight,
@@ -3366,6 +3367,16 @@ func enqueueHostedClustersFunc(metricsSet metrics.MetricsSet, operatorNamespace 
 		case *hyperv1.NodePool:
 			return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: typedObj.Spec.ClusterName, Namespace: typedObj.Namespace}}}
 		case *corev1.Secret:
+			// reconcile the karpenter token rotations to the userData secret, since the ignition-server/tokensecret_controller does not control it
+			if hcAnnotation, exists := typedObj.Annotations[hyperutil.HostedClusterAnnotation]; exists {
+				if nodePoolAnnotation, exists := typedObj.Annotations[hyperkarpenterv1.TokenSecretNodePoolAnnotation]; exists {
+					// only match tokenSecret with nodepool name karpenter and ignore changes to userDataSecret to avoid duplicate updates
+					if hyperutil.ParseNamespacedName(nodePoolAnnotation).Name == hyperkarpenterv1.KarpenterNodePool && strings.HasPrefix(typedObj.Name, "token-") {
+						// we still need to map the request to it's hostedcluster to trigger the reconcile
+						return []reconcile.Request{{NamespacedName: hyperutil.ParseNamespacedName(hcAnnotation)}}
+					}
+				}
+			}
 			if typedObj.Name == manifests.KASServingCertSecret("").Name {
 				for _, ownerRef := range typedObj.OwnerReferences {
 					if ownerRef.Kind == "HostedControlPlane" {
@@ -3666,6 +3677,10 @@ func (r *HostedClusterReconciler) validateAWSConfig(hc *hyperv1.HostedCluster) e
 	} else {
 		if !hyperutil.UseDedicatedDNSForKASByHC(hc) && kasPublishingStrategy.Type != hyperv1.LoadBalancer {
 			errs = append(errs, fmt.Errorf("service type %v with publishing strategy %v is not supported, use Route or LoadBalancer", hyperv1.APIServer, kasPublishingStrategy.Type))
+		}
+		// When using dedicated DNS, the KAS should be exposed as Route.
+		if hyperutil.IsPublicWithDNSByHC(hc) && hyperutil.IsLBKASByHC(hc) {
+			errs = append(errs, fmt.Errorf("service type %v with publishing strategy %v is not supported when any service specifies external DNS, use Route", hyperv1.APIServer, kasPublishingStrategy.Type))
 		}
 	}
 
@@ -4001,6 +4016,26 @@ func validateSliceNetworkCIDRs(hc *hyperv1.HostedCluster) field.ErrorList {
 		cidrEntries = append(cidrEntries, ce)
 	}
 
+	if hc.Spec.Networking.NetworkType == hyperv1.OVNKubernetes &&
+		hc.Spec.OperatorConfiguration != nil && hc.Spec.OperatorConfiguration.ClusterNetworkOperator != nil &&
+		hc.Spec.OperatorConfiguration.ClusterNetworkOperator.OVNKubernetesConfig != nil &&
+		hc.Spec.OperatorConfiguration.ClusterNetworkOperator.OVNKubernetesConfig.IPv4 != nil {
+		ovnConfig := hc.Spec.OperatorConfiguration.ClusterNetworkOperator.OVNKubernetesConfig.IPv4
+		if ovnConfig.InternalJoinSubnet != "" {
+			_, cidr, err := net.ParseCIDR(ovnConfig.InternalJoinSubnet)
+			if err == nil {
+				ce := cidrEntry{*cidr, *field.NewPath("spec", "operatorConfiguration", "clusterNetworkOperator", "ovnKubernetesConfig", "ipv4", "internalJoinSubnet")}
+				cidrEntries = append(cidrEntries, ce)
+			}
+		}
+		if ovnConfig.InternalTransitSwitchSubnet != "" {
+			_, cidr, err := net.ParseCIDR(ovnConfig.InternalTransitSwitchSubnet)
+			if err == nil {
+				ce := cidrEntry{*cidr, *field.NewPath("spec", "operatorConfiguration", "clusterNetworkOperator", "ovnKubernetesConfig", "ipv4", "internalTransitSwitchSubnet")}
+				cidrEntries = append(cidrEntries, ce)
+			}
+		}
+	}
 	return compareCIDREntries(cidrEntries)
 }
 

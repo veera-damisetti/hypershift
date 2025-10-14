@@ -18,6 +18,7 @@ import (
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/api/util/ipnet"
 	"github.com/openshift/hypershift/support/assets"
+	"github.com/openshift/hypershift/support/azureutil"
 	e2eutil "github.com/openshift/hypershift/test/e2e/util"
 	"github.com/openshift/hypershift/test/integration"
 	integrationframework "github.com/openshift/hypershift/test/integration/framework"
@@ -1004,49 +1005,6 @@ func TestOnCreateAPIUX(t *testing.T) {
 						},
 						expectedErrorSubstring: "only route is allowed when type is Route, and forbidden otherwise",
 					},
-					{
-						name: "when platform is Azure and not all services are route with hostname it should fail",
-						mutateInput: func(hc *hyperv1.HostedCluster) {
-							hc.Spec.Platform.Type = hyperv1.AzurePlatform
-							hc.Spec.Services = []hyperv1.ServicePublishingStrategyMapping{
-								{
-									Service: hyperv1.APIServer,
-									ServicePublishingStrategy: hyperv1.ServicePublishingStrategy{
-										Type: hyperv1.Route,
-										Route: &hyperv1.RoutePublishingStrategy{
-											Hostname: "api.example.com",
-										},
-									},
-								},
-								{
-									Service: hyperv1.Ignition,
-									ServicePublishingStrategy: hyperv1.ServicePublishingStrategy{
-										Type: hyperv1.NodePort,
-										Route: &hyperv1.RoutePublishingStrategy{
-											Hostname: "ignition.example.com",
-										},
-									},
-								},
-								{
-									Service: hyperv1.Konnectivity,
-									ServicePublishingStrategy: hyperv1.ServicePublishingStrategy{
-										Type: hyperv1.Route,
-										Route: &hyperv1.RoutePublishingStrategy{
-											Hostname: "konnectivity.example.com",
-										},
-									},
-								},
-								{
-									Service: hyperv1.OAuthServer,
-									ServicePublishingStrategy: hyperv1.ServicePublishingStrategy{
-										Type:  hyperv1.Route,
-										Route: &hyperv1.RoutePublishingStrategy{},
-									},
-								},
-							}
-						},
-						expectedErrorSubstring: "Azure platform requires Ignition Route service with a hostname to be defined",
-					},
 				},
 			},
 			{
@@ -1413,6 +1371,57 @@ func TestOnCreateAPIUX(t *testing.T) {
 						},
 						expectedErrorSubstring: "",
 					},
+					{
+						name: "when ovnKubernetesConfig is set and networkType is not OVNKubernetes it should fail",
+						mutateInput: func(hc *hyperv1.HostedCluster) {
+							hc.Spec.Networking = hyperv1.ClusterNetworking{
+								NetworkType: hyperv1.OpenShiftSDN,
+							}
+							hc.Spec.OperatorConfiguration = &hyperv1.OperatorConfiguration{
+								ClusterNetworkOperator: &hyperv1.ClusterNetworkOperatorSpec{
+									OVNKubernetesConfig: &hyperv1.OVNKubernetesConfig{
+										IPv4: &hyperv1.OVNIPv4Config{
+											InternalJoinSubnet: "10.10.0.0/16",
+										},
+									},
+								},
+							}
+						},
+						expectedErrorSubstring: "ovnKubernetesConfig is forbidden when networkType is not OVNKubernetes",
+					},
+					{
+						name: "when ovnKubernetesConfig is set and networkType is OVNKubernetes it should pass",
+						mutateInput: func(hc *hyperv1.HostedCluster) {
+							hc.Spec.Networking = hyperv1.ClusterNetworking{
+								NetworkType: hyperv1.OVNKubernetes,
+							}
+							hc.Spec.OperatorConfiguration = &hyperv1.OperatorConfiguration{
+								ClusterNetworkOperator: &hyperv1.ClusterNetworkOperatorSpec{
+									OVNKubernetesConfig: &hyperv1.OVNKubernetesConfig{
+										IPv4: &hyperv1.OVNIPv4Config{
+											InternalJoinSubnet:          "10.10.0.0/16",
+											InternalTransitSwitchSubnet: "10.20.0.0/16",
+										},
+									},
+								},
+							}
+						},
+						expectedErrorSubstring: "",
+					},
+					{
+						name: "when ovnKubernetesConfig is not set and networkType is not OVNKubernetes it should pass",
+						mutateInput: func(hc *hyperv1.HostedCluster) {
+							hc.Spec.Networking = hyperv1.ClusterNetworking{
+								NetworkType: hyperv1.OpenShiftSDN,
+							}
+							hc.Spec.OperatorConfiguration = &hyperv1.OperatorConfiguration{
+								ClusterNetworkOperator: &hyperv1.ClusterNetworkOperatorSpec{
+									DisableMultiNetwork: ptr.To(false),
+								},
+							}
+						},
+						expectedErrorSubstring: "",
+					},
 				},
 			},
 		}
@@ -1638,6 +1647,112 @@ func TestOnCreateAPIUX(t *testing.T) {
 				},
 			},
 			{
+				name: "when AWS placement options have invalid configurations it should fail",
+				file: "nodepool-base.yaml",
+				validations: []struct {
+					name                   string
+					mutateInput            func(*hyperv1.NodePool)
+					expectedErrorSubstring string
+				}{
+					{
+						name: "when tenancy is 'host' and capacity reservation is specified it should fail",
+						mutateInput: func(np *hyperv1.NodePool) {
+							np.Spec.Platform.AWS.Placement = &hyperv1.PlacementOptions{
+								Tenancy: "host",
+								CapacityReservation: &hyperv1.CapacityReservationOptions{
+									ID: ptr.To("cr-1234567890abcdef0"),
+								},
+							}
+						},
+						expectedErrorSubstring: "AWS Capacity Reservations cannot be used with Dedicated Hosts (tenancy 'host')",
+					},
+					{
+						name: "when capacity reservation ID is specified with preference 'None' it should fail",
+						mutateInput: func(np *hyperv1.NodePool) {
+							np.Spec.Platform.AWS.Placement = &hyperv1.PlacementOptions{
+								CapacityReservation: &hyperv1.CapacityReservationOptions{
+									ID:         ptr.To("cr-1234567890abcdef0"),
+									Preference: hyperv1.CapacityReservationPreferenceNone,
+								},
+							}
+						},
+						expectedErrorSubstring: "AWS Capacity Reservation preference 'None' or 'Open' is incompatible with specifying a Capacity Reservation ID",
+					},
+					{
+						name: "when capacity reservation ID is specified with preference 'Open' it should fail",
+						mutateInput: func(np *hyperv1.NodePool) {
+							np.Spec.Platform.AWS.Placement = &hyperv1.PlacementOptions{
+								CapacityReservation: &hyperv1.CapacityReservationOptions{
+									ID:         ptr.To("cr-1234567890abcdef0"),
+									Preference: hyperv1.CapacityReservationPreferenceOpen,
+								},
+							}
+						},
+						expectedErrorSubstring: "AWS Capacity Reservation preference 'None' or 'Open' is incompatible with specifying a Capacity Reservation ID",
+					},
+					{
+						name: "when capacity reservation ID has invalid format it should fail",
+						mutateInput: func(np *hyperv1.NodePool) {
+							np.Spec.Platform.AWS.Placement = &hyperv1.PlacementOptions{
+								CapacityReservation: &hyperv1.CapacityReservationOptions{
+									ID: ptr.To("invalid-id"),
+								},
+							}
+						},
+						expectedErrorSubstring: "AWS Capacity Reservation ID must start with 'cr-' followed by 17 lowercase hexadecimal characters",
+					},
+					{
+						name: "when marketType is 'CapacityBlocks' without capacity reservation ID it should fail",
+						mutateInput: func(np *hyperv1.NodePool) {
+							np.Spec.Platform.AWS.Placement = &hyperv1.PlacementOptions{
+								CapacityReservation: &hyperv1.CapacityReservationOptions{
+									MarketType: hyperv1.MarketTypeCapacityBlock,
+									Preference: hyperv1.CapacityReservationPreferenceOpen,
+								},
+							}
+						},
+						expectedErrorSubstring: "AWS Capacity Reservation market type 'CapacityBlocks' requires a Capacity Reservation ID",
+					},
+					{
+						name: "when tenancy is 'default' with capacity reservation it should pass",
+						mutateInput: func(np *hyperv1.NodePool) {
+							np.Spec.Platform.AWS.Placement = &hyperv1.PlacementOptions{
+								Tenancy: "default",
+								CapacityReservation: &hyperv1.CapacityReservationOptions{
+									ID: ptr.To("cr-1234567890abcdef0"),
+								},
+							}
+						},
+						expectedErrorSubstring: "",
+					},
+					{
+						name: "when capacity reservation has preference 'Open' without ID it should pass",
+						mutateInput: func(np *hyperv1.NodePool) {
+							np.Spec.Platform.AWS.Placement = &hyperv1.PlacementOptions{
+								CapacityReservation: &hyperv1.CapacityReservationOptions{
+									Preference: hyperv1.CapacityReservationPreferenceOpen,
+									MarketType: hyperv1.MarketTypeOnDemand,
+								},
+							}
+						},
+						expectedErrorSubstring: "",
+					},
+					{
+						name: "when capacity reservation ID is specified with preference 'CapacityReservationsOnly' it should pass",
+						mutateInput: func(np *hyperv1.NodePool) {
+							np.Spec.Platform.AWS.Placement = &hyperv1.PlacementOptions{
+								CapacityReservation: &hyperv1.CapacityReservationOptions{
+									ID:         ptr.To("cr-1234567890abcdef0"),
+									Preference: hyperv1.CapacityReservationPreferenceOnly,
+									MarketType: hyperv1.MarketTypeCapacityBlock,
+								},
+							}
+						},
+						expectedErrorSubstring: "",
+					},
+				},
+			},
+			{
 				name: "when arch is s390x and platform is not kubevirt it should fail",
 				file: "nodepool-base.yaml",
 				validations: []struct {
@@ -1709,7 +1824,7 @@ func TestCreateCluster(t *testing.T) {
 
 	e2eutil.NewHypershiftTest(t, ctx, func(t *testing.T, g Gomega, mgtClient crclient.Client, hostedCluster *hyperv1.HostedCluster) {
 		// Sanity check the cluster by waiting for the nodes to report ready
-		_ = e2eutil.WaitForGuestClient(t, ctx, mgtClient, hostedCluster)
+		guestClient := e2eutil.WaitForGuestClient(t, ctx, mgtClient, hostedCluster)
 
 		t.Logf("fetching mgmt kubeconfig")
 		mgmtCfg, err := e2eutil.GetConfig()
@@ -1735,6 +1850,7 @@ func TestCreateCluster(t *testing.T) {
 		e2eutil.EnsureCustomLabels(t, ctx, mgtClient, hostedCluster)
 		e2eutil.EnsureCustomTolerations(t, ctx, mgtClient, hostedCluster)
 		e2eutil.EnsureAppLabel(t, ctx, mgtClient, hostedCluster)
+		e2eutil.EnsureFeatureGateStatus(t, ctx, guestClient)
 
 		// ensure KAS DNS name is configured with a KAS Serving cert
 		e2eutil.EnsureKubeAPIDNSNameCustomCert(t, ctx, mgtClient, hostedCluster)
@@ -1856,15 +1972,28 @@ func TestCreateClusterRequestServingIsolation(t *testing.T) {
 }
 
 func TestCreateClusterCustomConfig(t *testing.T) {
-	if globalOpts.Platform != hyperv1.AWSPlatform {
-		t.Skip("test only supported on platform AWS")
+	if globalOpts.Platform != hyperv1.AWSPlatform && globalOpts.Platform != hyperv1.AzurePlatform {
+		t.Skip("test only supported on platform AWS and Azure")
 	}
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(testContext)
 	defer cancel()
 
+	var (
+		kmsKeyArn                      *string
+		kmsKeyInfo                     *azureutil.AzureEncryptionKey
+		kmsUserAssignedCredsSecretName string
+		err                            error
+	)
+
 	clusterOpts := globalOpts.DefaultClusterOptions(t)
+
+	// Configure KMS settings for Azure platform (this test specifically tests KMS functionality)
+	if globalOpts.Platform == hyperv1.AzurePlatform {
+		clusterOpts.AzurePlatform.EncryptionKeyID = globalOpts.ConfigurableClusterOptions.AzureEncryptionKeyID
+		clusterOpts.AzurePlatform.KMSUserAssignedCredsSecretName = globalOpts.ConfigurableClusterOptions.AzureKMSUserAssignedCredsSecretName
+	}
 
 	clusterOpts.BeforeApply = func(o crclient.Object) {
 		switch hc := o.(type) {
@@ -1894,18 +2023,45 @@ func TestCreateClusterCustomConfig(t *testing.T) {
 		}
 	}
 
-	// find kms key ARN using alias
-	kmsKeyArn, err := e2eutil.GetKMSKeyArn(clusterOpts.AWSPlatform.Credentials.AWSCredentialsFile, clusterOpts.AWSPlatform.Region, globalOpts.ConfigurableClusterOptions.AWSKmsKeyAlias)
-	if err != nil || kmsKeyArn == nil {
-		t.Fatal("failed to retrieve kms key arn")
-	}
+	switch globalOpts.Platform {
+	case hyperv1.AWSPlatform:
+		// find kms key ARN using alias
+		kmsKeyArn, err = e2eutil.GetKMSKeyArn(clusterOpts.AWSPlatform.Credentials.AWSCredentialsFile, clusterOpts.AWSPlatform.Region, globalOpts.ConfigurableClusterOptions.AWSKmsKeyAlias)
+		if err != nil || kmsKeyArn == nil {
+			t.Fatal("failed to retrieve kms key arn: %w", err)
+		}
+		clusterOpts.AWSPlatform.EtcdKMSKeyARN = *kmsKeyArn
+	case hyperv1.AzurePlatform:
+		if globalOpts.ConfigurableClusterOptions.AzureEncryptionKeyID == "" {
+			t.Fatal("azure encryption key id is required")
+		}
+		if globalOpts.ConfigurableClusterOptions.AzureKMSUserAssignedCredsSecretName == "" {
+			t.Fatal("azure kms user assigned creds secret name is required")
+		}
 
-	clusterOpts.AWSPlatform.EtcdKMSKeyARN = *kmsKeyArn
+		kmsUserAssignedCredsSecretName = globalOpts.ConfigurableClusterOptions.AzureKMSUserAssignedCredsSecretName
+		kmsKeyInfo, err = azureutil.GetAzureEncryptionKeyInfo(globalOpts.ConfigurableClusterOptions.AzureEncryptionKeyID)
+		if err != nil {
+			t.Fatal("failed to get azure encryption key info: %w", err)
+		}
+	}
 
 	e2eutil.NewHypershiftTest(t, ctx, func(t *testing.T, g Gomega, mgtClient crclient.Client, hostedCluster *hyperv1.HostedCluster) {
 
-		g.Expect(hostedCluster.Spec.SecretEncryption.KMS.AWS.ActiveKey.ARN).To(Equal(*kmsKeyArn))
-		g.Expect(hostedCluster.Spec.SecretEncryption.KMS.AWS.Auth.AWSKMSRoleARN).ToNot(BeEmpty())
+		switch globalOpts.Platform {
+		case hyperv1.AWSPlatform:
+			g.Expect(hostedCluster.Spec.SecretEncryption.KMS.AWS.ActiveKey.ARN).To(Equal(*kmsKeyArn))
+			g.Expect(hostedCluster.Spec.SecretEncryption.KMS.AWS.Auth.AWSKMSRoleARN).ToNot(BeEmpty())
+		case hyperv1.AzurePlatform:
+			g.Expect(hostedCluster.Spec.SecretEncryption).ToNot(BeNil(), "SecretEncryption must be set")
+			g.Expect(hostedCluster.Spec.SecretEncryption.KMS).ToNot(BeNil(), "SecretEncryption.KMS must be set")
+			g.Expect(hostedCluster.Spec.SecretEncryption.KMS.Azure).ToNot(BeNil(), "KMS.Azure must be set")
+			g.Expect(hostedCluster.Spec.SecretEncryption.KMS.Azure.ActiveKey.KeyVaultName).To(Equal(kmsKeyInfo.KeyVaultName))
+			g.Expect(hostedCluster.Spec.SecretEncryption.KMS.Azure.ActiveKey.KeyName).To(Equal(kmsKeyInfo.KeyName))
+			g.Expect(hostedCluster.Spec.SecretEncryption.KMS.Azure.ActiveKey.KeyVersion).To(Equal(kmsKeyInfo.KeyVersion))
+			g.Expect(hostedCluster.Spec.SecretEncryption.KMS.Azure.KMS.CredentialsSecretName).To(Equal(kmsUserAssignedCredsSecretName))
+			g.Expect(hostedCluster.Spec.SecretEncryption.KMS.Azure.KMS.ObjectEncoding).To(Equal(hyperv1.ObjectEncodingFormat("utf-8")))
+		}
 
 		guestClient := e2eutil.WaitForGuestClient(t, testContext, mgtClient, hostedCluster)
 		e2eutil.EnsureSecretEncryptedUsingKMSV2(t, ctx, hostedCluster, guestClient)
@@ -1931,6 +2087,9 @@ func TestCreateClusterCustomConfig(t *testing.T) {
 
 		// ensure ingress component is disabled
 		e2eutil.EnsureIngressCapabilityDisabled(ctx, t, clients, mgtClient, hostedCluster)
+
+		// ensure CNO operator configuration changes are properly handled
+		e2eutil.EnsureCNOOperatorConfiguration(t, ctx, mgtClient, guestClient, hostedCluster)
 	}).Execute(&clusterOpts, globalOpts.Platform, globalOpts.ArtifactDir, "custom-config", globalOpts.ServiceAccountSigningKey)
 }
 

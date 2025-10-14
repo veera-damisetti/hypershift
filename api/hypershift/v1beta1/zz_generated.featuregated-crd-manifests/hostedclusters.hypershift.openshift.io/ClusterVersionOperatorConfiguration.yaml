@@ -2836,6 +2836,77 @@ spec:
                         x-kubernetes-validations:
                         - message: disableMultiNetwork is immutable
                           rule: self == oldSelf
+                      ovnKubernetesConfig:
+                        description: |-
+                          ovnKubernetesConfig holds OVN-Kubernetes specific configuration.
+                          This is only consumed when NetworkType is OVNKubernetes.
+                        minProperties: 1
+                        properties:
+                          ipv4:
+                            description: |-
+                              ipv4 allows users to configure IP settings for IPv4 connections. When omitted,
+                              this means no opinions and the default configuration is used. Check individual
+                              fields within ipv4 for details of default values.
+                            minProperties: 1
+                            properties:
+                              internalJoinSubnet:
+                                description: |-
+                                  internalJoinSubnet is a v4 subnet used internally by ovn-kubernetes in case the
+                                  default one is being already used by something else. It must not overlap with
+                                  any other subnet being used by OpenShift or by the node network. The size of the
+                                  subnet must be larger than the number of nodes.
+                                  The current default value is 100.64.0.0/16
+                                  The subnet must be large enough to accommodate one IP per node in your cluster
+                                  The value must be in proper IPV4 CIDR format
+                                maxLength: 18
+                                minLength: 9
+                                type: string
+                                x-kubernetes-validations:
+                                - message: Subnet must be in a valid IPv4 CIDR format
+                                    (e.g., 192.168.1.1/24)
+                                  rule: self.matches('^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$')
+                                    && self.split('/')[0].split('.').all(oct, int(oct)
+                                    >= 0 && int(oct) <= 255)
+                                - message: subnet must be in the range /0 to /30 inclusive
+                                  rule: self.matches('^.*/[0-9]+$') && int(self.split('/')[1])
+                                    <= 30
+                                - message: first IP address octet must not be 0
+                                  rule: self.matches('^[0-9]{1,3}\\..*') && int(self.split('/')[0].split('.')[0])
+                                    > 0
+                              internalTransitSwitchSubnet:
+                                description: |-
+                                  internalTransitSwitchSubnet is a v4 subnet in IPV4 CIDR format used internally
+                                  by OVN-Kubernetes for the distributed transit switch in the OVN Interconnect
+                                  architecture that connects the cluster routers on each node together to enable
+                                  east west traffic. The subnet chosen should not overlap with other networks
+                                  specified for OVN-Kubernetes as well as other networks used on the host.
+                                  When omitted, this means no opinion and the platform is left to choose a reasonable
+                                  default which is subject to change over time.
+                                  The current default subnet is 100.88.0.0/16
+                                  The subnet must be large enough to accommodate one IP per node in your cluster
+                                  The value must be in proper IPV4 CIDR format
+                                maxLength: 18
+                                minLength: 9
+                                type: string
+                                x-kubernetes-validations:
+                                - message: Subnet must be in a valid IPv4 CIDR format
+                                  rule: self.matches('^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$')
+                                    && self.split('/')[0].split('.').all(oct, int(oct)
+                                    >= 0 && int(oct) <= 255)
+                                - message: subnet must be in the range /0 to /30 inclusive
+                                  rule: self.matches('^.*/[0-9]+$') && int(self.split('/')[1])
+                                    <= 30
+                                - message: first IP address octet must not be 0
+                                  rule: self.matches('^[0-9]{1,3}\\..*') && int(self.split('/')[0].split('.')[0])
+                                    > 0
+                            type: object
+                        type: object
+                        x-kubernetes-validations:
+                        - message: internalJoinSubnet and internalTransitSwitchSubnet
+                            must not be the same
+                          rule: '!has(self.ipv4) || !has(self.ipv4.internalJoinSubnet)
+                            || !has(self.ipv4.internalTransitSwitchSubnet) || self.ipv4.internalJoinSubnet
+                            != self.ipv4.internalTransitSwitchSubnet'
                     type: object
                   clusterVersionOperator:
                     description: clusterVersionOperator specifies the configuration
@@ -4001,6 +4072,27 @@ spec:
                                 required:
                                 - clientID
                                 type: object
+                              network:
+                                description: |-
+                                  network is the client ID of a federated managed identity, associated with cluster-network-operator, used in
+                                  workload identity authentication.
+                                properties:
+                                  clientID:
+                                    description: clientID is client ID of a federated
+                                      managed identity used in workload identity authentication
+                                    maxLength: 36
+                                    minLength: 36
+                                    pattern: ^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$
+                                    type: string
+                                    x-kubernetes-validations:
+                                    - message: the client ID of a managed identity
+                                        must be a valid UUID. It should be 5 groups
+                                        of hyphen separated hexadecimal characters
+                                        in the form 8-4-4-4-12.
+                                      rule: self.matches('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')
+                                required:
+                                - clientID
+                                type: object
                               nodePoolManagement:
                                 description: |-
                                   nodePoolManagement is the client ID of a federated managed identity, associated with cluster-api-provider-azure, used
@@ -4028,6 +4120,7 @@ spec:
                             - file
                             - imageRegistry
                             - ingress
+                            - network
                             - nodePoolManagement
                             type: object
                         required:
@@ -5196,26 +5289,20 @@ spec:
                 and disruptive behavior.
               rule: 'self.platform.type != "IBMCloud" ? self.services == oldSelf.services
                 : true'
-            - message: Azure platform requires APIServer Route service with a hostname
-                to be defined
+            - message: Azure platform requires OAuthServer to use Route service publishing
+                strategy
               rule: 'self.platform.type == "Azure" ? self.services.exists(s, s.service
-                == "APIServer" && s.servicePublishingStrategy.type == "Route" && s.servicePublishingStrategy.route.hostname
-                != "") : true'
-            - message: Azure platform requires OAuthServer Route service with a hostname
-                to be defined
+                == "OAuthServer" && s.servicePublishingStrategy.type == "Route") :
+                true'
+            - message: Azure platform requires Konnectivity to use Route service publishing
+                strategy
               rule: 'self.platform.type == "Azure" ? self.services.exists(s, s.service
-                == "OAuthServer" && s.servicePublishingStrategy.type == "Route" &&
-                s.servicePublishingStrategy.route.hostname != "") : true'
-            - message: Azure platform requires Konnectivity Route service with a hostname
-                to be defined
+                == "Konnectivity" && s.servicePublishingStrategy.type == "Route")
+                : true'
+            - message: Azure platform requires Ignition to use Route service publishing
+                strategy
               rule: 'self.platform.type == "Azure" ? self.services.exists(s, s.service
-                == "Konnectivity" && s.servicePublishingStrategy.type == "Route" &&
-                s.servicePublishingStrategy.route.hostname != "") : true'
-            - message: Azure platform requires Ignition Route service with a hostname
-                to be defined
-              rule: 'self.platform.type == "Azure" ? self.services.exists(s, s.service
-                == "Ignition" && s.servicePublishingStrategy.type == "Route" && s.servicePublishingStrategy.route.hostname
-                != "") : true'
+                == "Ignition" && s.servicePublishingStrategy.type == "Route") : true'
             - message: If serviceAccountSigningKey is set, issuerURL must be set
               rule: has(self.issuerURL) || !has(self.serviceAccountSigningKey)
             - message: APIServer loadBalancer hostname cannot be in ClusterConfiguration.apiserver.servingCerts.namedCertificates[]
@@ -5229,6 +5316,8 @@ spec:
                 || !has(self.operatorConfiguration.clusterNetworkOperator.disableMultiNetwork)
                 || !self.operatorConfiguration.clusterNetworkOperator.disableMultiNetwork
                 || self.networking.networkType == ''Other'''
+            - message: ovnKubernetesConfig is forbidden when networkType is not OVNKubernetes
+              rule: self.networking.networkType == 'OVNKubernetes' || !self.?operatorConfiguration.clusterNetworkOperator.ovnKubernetesConfig.hasValue()
           status:
             description: status is the latest observed status of the HostedCluster.
             properties:
@@ -5295,6 +5384,41 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              configuration:
+                description: configuration contains the cluster configuration status
+                  of the HostedCluster
+                properties:
+                  authentication:
+                    description: |-
+                      authentication contains the observed authentication configuration status from the hosted cluster.
+                      This field reflects the current state of the cluster authentication including OAuth metadata,
+                      OIDC client status, and other authentication-related configurations.
+                    properties:
+                      integratedOAuthMetadata:
+                        description: |-
+                          integratedOAuthMetadata contains the discovery endpoint data for OAuth 2.0
+                          Authorization Server Metadata for the in-cluster integrated OAuth server.
+                          This discovery document can be viewed from its served location:
+                          oc get --raw '/.well-known/oauth-authorization-server'
+                          For further details, see the IETF Draft:
+                          https://tools.ietf.org/html/draft-ietf-oauth-discovery-04#section-2
+                          This contains the observed value based on cluster state.
+                          An explicitly set value in spec.oauthMetadata has precedence over this field.
+                          This field has no meaning if authentication spec.type is not set to IntegratedOAuth.
+                          The key "oauthMetadata" is used to locate the data.
+                          If the config map or expected key is not found, no metadata is served.
+                          If the specified metadata is not valid, no metadata is served.
+                          The namespace for this config map is openshift-config-managed.
+                        properties:
+                          name:
+                            description: name is the metadata.name of the referenced
+                              config map
+                            type: string
+                        required:
+                        - name
+                        type: object
+                    type: object
+                type: object
               controlPlaneEndpoint:
                 description: |-
                   controlPlaneEndpoint contains the endpoint information by which

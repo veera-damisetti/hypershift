@@ -26,8 +26,8 @@ import (
 	hcmetrics "github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/metrics"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests"
 	npmetrics "github.com/openshift/hypershift/hypershift-operator/controllers/nodepool/metrics"
-	karpenterassets "github.com/openshift/hypershift/karpenter-operator/controllers/karpenter/assets"
 	"github.com/openshift/hypershift/support/azureutil"
+	"github.com/openshift/hypershift/support/util"
 
 	configv1 "github.com/openshift/api/config/v1"
 
@@ -96,7 +96,7 @@ func (h *hypershiftTest) Execute(opts *PlatformAgnosticOptions, platform hyperv1
 		}
 
 		h.teardown(hostedCluster, opts, artifactDir, false)
-		h.postTeardown(hostedCluster, opts)
+		h.postTeardown(hostedCluster, opts, platform)
 	}()
 
 	// fail safe to guarantee teardown() is always executed.
@@ -149,6 +149,7 @@ func (h *hypershiftTest) after(hostedCluster *hyperv1.HostedCluster, platform hy
 
 		EnsurePayloadArchSetCorrectly(t, context.Background(), h.client, hostedCluster)
 		EnsurePodsWithEmptyDirPVsHaveSafeToEvictAnnotations(t, context.Background(), h.client, hcpNs)
+		EnsureReadOnlyRootFilesystem(t, context.Background(), h.client, hcpNs)
 		EnsureAllContainersHavePullPolicyIfNotPresent(t, context.Background(), h.client, hostedCluster)
 		EnsureAllContainersHaveTerminationMessagePolicyFallbackToLogsOnError(t, context.Background(), h.client, hostedCluster)
 		EnsureHCPContainersHaveResourceRequests(t, context.Background(), h.client, hostedCluster)
@@ -169,17 +170,47 @@ func (h *hypershiftTest) after(hostedCluster *hyperv1.HostedCluster, platform hy
 		if platform == hyperv1.AzurePlatform && azureutil.IsAroHCP() && !IsLessThan(Version420) {
 			EnsureSecurityContextUID(t, context.Background(), h.client, hostedCluster)
 		}
-		ValidateMetrics(t, context.Background(), hostedCluster, []string{
-			hcmetrics.SilenceAlertsMetricName,
+		metricsToValidate := []string{hcmetrics.SilenceAlertsMetricName, // common metrics
 			hcmetrics.LimitedSupportEnabledMetricName,
 			hcmetrics.ProxyMetricName,
-			hcmetrics.InvalidAwsCredsMetricName,
 			HypershiftOperatorInfoName,
 			npmetrics.SizeMetricName,
 			npmetrics.AvailableReplicasMetricName,
-			karpenterassets.KarpenterBuildInfoMetricName,
-			karpenterassets.KarpenterOperatorInfoMetricName,
-		}, true)
+		}
+		AWSMetrics := []string{hcmetrics.InvalidAwsCredsMetricName}
+
+		AzureMetrics := []string{
+			hcmetrics.HostedClusterManagedAzureInfoMetricName,
+			/* only Managed Azure ARO at the moment
+			//hcmetrics.HostedClusterAzureInfoMetricName,
+			*/
+		}
+
+		switch platform {
+		case hyperv1.AWSPlatform:
+			metricsToValidate = append(metricsToValidate, AWSMetrics...)
+		case hyperv1.AzurePlatform:
+			metricsToValidate = append(metricsToValidate, AzureMetrics...)
+		}
+
+		ValidateMetrics(t, context.Background(), h.client, hostedCluster, metricsToValidate, true)
+
+		// TestHAEtcdChaos runs as NonePlatform and it's broken.
+		// so skipping until we fix it.
+		// TODO(alberto): consider drop this gate when we fix OCPBUGS-61291.
+		if hostedCluster.Spec.Platform.Type != hyperv1.NonePlatform {
+			// Private clusters may won't be reachable from the test runner; assume workers exist.
+			hasWorkerNodes := true
+			if !util.IsPrivateHC(hostedCluster) {
+				guestClient := WaitForGuestClient(t, t.Context(), h.client, hostedCluster)
+				var nodeList corev1.NodeList
+				if err := guestClient.List(t.Context(), &nodeList); err != nil {
+					t.Errorf("failed to list nodes in guest cluster: %v", err)
+				}
+				hasWorkerNodes = len(nodeList.Items) > 0
+			}
+			ValidateHostedClusterConditions(t, t.Context(), h.client, hostedCluster, hasWorkerNodes, 10*time.Minute)
+		}
 	})
 }
 
@@ -202,7 +233,7 @@ func (h *hypershiftTest) teardown(hostedCluster *hyperv1.HostedCluster, opts *Pl
 	})
 }
 
-func (h *hypershiftTest) postTeardown(hostedCluster *hyperv1.HostedCluster, opts *PlatformAgnosticOptions) {
+func (h *hypershiftTest) postTeardown(hostedCluster *hyperv1.HostedCluster, opts *PlatformAgnosticOptions, platform hyperv1.PlatformType) {
 	// don't run if test has already failed
 	if h.Failed() {
 		h.Logf("skipping postTeardown()")
@@ -210,7 +241,7 @@ func (h *hypershiftTest) postTeardown(hostedCluster *hyperv1.HostedCluster, opts
 	}
 
 	h.Run("PostTeardown", func(t *testing.T) {
-		ValidateMetrics(t, h.ctx, hostedCluster, []string{
+		ValidateMetrics(t, h.ctx, h.client, hostedCluster, []string{
 			hcmetrics.WaitingInitialAvailabilityDurationMetricName,
 			hcmetrics.InitialRollingOutDurationMetricName,
 			hcmetrics.UpgradingDurationMetricName,
@@ -315,10 +346,13 @@ func (h *hypershiftTest) createHostedCluster(opts *PlatformAgnosticOptions, plat
 							},
 						},
 					}
+				}
 
-					if opts.ExtOIDCConfig != nil {
-						v.Spec.Configuration.Authentication = opts.ExtOIDCConfig.GetAuthenticationConfig()
+				if opts.ExtOIDCConfig != nil {
+					if v.Spec.Configuration == nil {
+						v.Spec.Configuration = &hyperv1.ClusterConfiguration{}
 					}
+					v.Spec.Configuration.Authentication = opts.ExtOIDCConfig.GetAuthenticationConfig()
 				}
 			}
 		}

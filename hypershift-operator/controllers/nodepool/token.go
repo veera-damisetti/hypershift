@@ -8,9 +8,11 @@ import (
 	"time"
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	hyperkarpenterv1 "github.com/openshift/hypershift/api/karpenter/v1beta1"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests/ignitionserver"
 	"github.com/openshift/hypershift/support/backwardcompat"
 	"github.com/openshift/hypershift/support/globalconfig"
+	karpenterutil "github.com/openshift/hypershift/support/karpenter"
 	"github.com/openshift/hypershift/support/upsert"
 	supportutil "github.com/openshift/hypershift/support/util"
 
@@ -308,6 +310,11 @@ func (t *Token) reconcileTokenSecret(tokenSecret *corev1.Secret) error {
 	tokenSecret.Annotations[TokenSecretAnnotation] = "true"
 	tokenSecret.Annotations[TokenSecretNodePoolUpgradeType] = string(t.nodePool.Spec.Management.UpgradeType)
 	tokenSecret.Annotations[nodePoolAnnotation] = client.ObjectKeyFromObject(t.nodePool).String()
+	if karpenterutil.IsKarpenterEnabled(t.hostedCluster.Spec.AutoNode) {
+		if t.nodePool.GetName() == hyperkarpenterv1.KarpenterNodePool {
+			tokenSecret.Annotations[supportutil.HostedClusterAnnotation] = client.ObjectKeyFromObject(t.ConfigGenerator.hostedCluster).String()
+		}
+	}
 	// active token should never be marked as expired.
 	delete(tokenSecret.Annotations, hyperv1.IgnitionServerTokenExpirationTimestampAnnotation)
 
@@ -362,12 +369,11 @@ func (t *Token) reconcileUserDataSecret(userDataSecret *corev1.Secret, token str
 		userDataSecret.Labels = make(map[string]string)
 	}
 
-	if t.hostedCluster.Spec.AutoNode != nil && t.hostedCluster.Spec.AutoNode.Provisioner.Name == hyperv1.ProvisionerKarpeneter &&
-		t.hostedCluster.Spec.AutoNode.Provisioner.Karpenter.Platform == hyperv1.AWSPlatform {
+	if karpenterutil.IsKarpenterEnabled(t.hostedCluster.Spec.AutoNode) {
 		// TODO(alberto): prevent nodePool name collisions adding prefix to karpenter NodePool.
-		if t.nodePool.GetName() == "karpenter" {
+		if t.nodePool.GetName() == hyperkarpenterv1.KarpenterNodePool {
 			userDataSecret.Labels[hyperv1.NodePoolLabel] = fmt.Sprintf("%s-%s", t.nodePool.Spec.ClusterName, t.nodePool.GetName())
-			userDataSecret.Labels["hypershift.openshift.io/ami"] = t.userData.ami
+			userDataSecret.Labels[hyperkarpenterv1.UserDataAMILabel] = t.userData.ami
 		}
 
 	}

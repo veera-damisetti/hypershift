@@ -6,16 +6,21 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	. "github.com/onsi/gomega"
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests"
+	"github.com/openshift/hypershift/support/util"
 	e2eutil "github.com/openshift/hypershift/test/e2e/util"
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -119,6 +124,14 @@ func testAutoscaling(ctx context.Context, mgtClient crclient.Client, hostedClust
 		err = guestClient.Create(ctx, workload)
 		g.Expect(err).NotTo(HaveOccurred())
 		t.Logf("Created workload. Node: %s, memcapacity: %s", nodes[0].Name, memCapacity.String())
+		defer func() {
+			// Clean up workload if WaitForNReadyNodes fails
+			cascadeDelete := metav1.DeletePropagationForeground
+			// Ignore error, might be already deleted
+			_ = guestClient.Delete(ctx, workload, &crclient.DeleteOptions{
+				PropagationPolicy: &cascadeDelete,
+			})
+		}()
 
 		// Wait for one more node.
 		// TODO (alberto): have ability for NodePool to label Nodes and let workload target specific Nodes.
@@ -176,27 +189,29 @@ func testAutoscalingBalancing(ctx context.Context, mgtClient crclient.Client, ho
 		// TODO (alberto): have ability to label and get Nodes by NodePool. NodePool.Status.Nodes?
 		nodes := e2eutil.WaitForNReadyNodes(t, ctx, guestClient, numNodes, hostedCluster.Spec.Platform.Type)
 
-		err = mgtClient.Get(ctx, crclient.ObjectKeyFromObject(hostedCluster), hostedCluster)
-		g.Expect(err).NotTo(HaveOccurred(), "failed to get latest HostedCluster")
 		// Enable HostedCluster downscaling, set expanders and ignore labels
-		hostedCluster.Spec.Autoscaling = hyperv1.ClusterAutoscaling{
-			Scaling: hyperv1.ScaleUpAndScaleDown,
-			Expanders: []hyperv1.ExpanderString{
-				hyperv1.RandomExpander,
-			},
-			ScaleDown: &hyperv1.ScaleDownConfig{
-				DelayAfterAddSeconds:        ptr.To[int32](300),
-				UnneededDurationSeconds:     ptr.To[int32](600),
-				UtilizationThresholdPercent: ptr.To[int32](50),
-			},
-			BalancingIgnoredLabels: []string{
-				"custom.ignore.label",
-			},
-			MaxNodesTotal:                 ptr.To[int32](4),
-			MaxFreeDifferenceRatioPercent: ptr.To[int32](50),
-		}
-		// update HostedCluster
-		err = mgtClient.Update(ctx, hostedCluster)
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			if err := mgtClient.Get(ctx, crclient.ObjectKeyFromObject(hostedCluster), hostedCluster); err != nil {
+				return err
+			}
+			hostedCluster.Spec.Autoscaling = hyperv1.ClusterAutoscaling{
+				Scaling: hyperv1.ScaleUpAndScaleDown,
+				Expanders: []hyperv1.ExpanderString{
+					hyperv1.RandomExpander,
+				},
+				ScaleDown: &hyperv1.ScaleDownConfig{
+					DelayAfterAddSeconds:        ptr.To[int32](300),
+					UnneededDurationSeconds:     ptr.To[int32](600),
+					UtilizationThresholdPercent: ptr.To[int32](50),
+				},
+				BalancingIgnoredLabels: []string{
+					"custom.ignore.label",
+				},
+				MaxNodesTotal:                 ptr.To[int32](4),
+				MaxFreeDifferenceRatioPercent: ptr.To[int32](50),
+			}
+			return mgtClient.Update(ctx, hostedCluster)
+		})
 		g.Expect(err).NotTo(HaveOccurred(), "failed to update HostedCluster")
 
 		// check NodePool autoscalingEnabled condition for both nodepools
@@ -226,6 +241,26 @@ func testAutoscalingBalancing(ctx context.Context, mgtClient crclient.Client, ho
 				}
 			}
 			return false, "autoscaling condition not found", nil
+		}}, e2eutil.WithInterval(10*time.Second), e2eutil.WithTimeout(5*time.Minute))
+
+		// Wait for autoscaler deployment to have autoscaling settings and be ready
+		// TODO (cewong): This should be reported in the HostedCluster as a condition
+		controlPlaneNamespace := manifests.HostedControlPlaneNamespace(hostedCluster.Namespace, hostedCluster.Name)
+		e2eutil.EventuallyObject(t, ctx, "autoscaler deployment to have autoscaling settings and be ready", func(ctx context.Context) (*appsv1.Deployment, error) {
+			autoscalerDeployment := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: controlPlaneNamespace, Name: "cluster-autoscaler"}}
+			err := mgtClient.Get(ctx, crclient.ObjectKeyFromObject(autoscalerDeployment), autoscalerDeployment)
+			return autoscalerDeployment, err
+		}, []e2eutil.Predicate[*appsv1.Deployment]{func(autoscalerDeployment *appsv1.Deployment) (done bool, reasons string, err error) {
+			hasBalancingIgnoreLabel := false
+			for _, arg := range autoscalerDeployment.Spec.Template.Spec.Containers[0].Args {
+				if strings.Contains(arg, "custom.ignore.label") {
+					hasBalancingIgnoreLabel = true
+				}
+			}
+			if !hasBalancingIgnoreLabel {
+				return false, "autoscaler deployment does not have balancing ignore label", nil
+			}
+			return util.IsDeploymentReady(ctx, autoscalerDeployment), "autoscaler deployment not ready", nil
 		}}, e2eutil.WithInterval(10*time.Second), e2eutil.WithTimeout(5*time.Minute))
 
 		// Generate workload.

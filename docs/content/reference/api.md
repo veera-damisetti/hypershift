@@ -815,14 +815,17 @@ Release
 </em>
 </td>
 <td>
-<p>release specifies the OCP release used for the NodePool. This informs the
-ignition configuration for machines which includes the kubelet version, as well as other platform specific
-machine properties (e.g. an AMI on the AWS platform).
-It&rsquo;s not supported to use a release in a NodePool which minor version skew against the Control Plane release is bigger than N-2. Although there&rsquo;s no enforcement that prevents this from happening.
-Attempting to use a release with a bigger skew might result in unpredictable behaviour.
-Attempting to use a release higher than the HosterCluster one will result in the NodePool being degraded and the ValidReleaseImage condition being false.
-Attempting to use a release lower than the current NodePool y-stream will result in the NodePool being degraded and the ValidReleaseImage condition being false.
-Changing this field will trigger a NodePool rollout.</p>
+<p>release specifies the OCP release used for this NodePool. It drives the machine ignition configuration (including
+the kubelet version) and other platform-specific properties (e.g. an AMI on AWS).</p>
+<p>Version-skew rules and effects:
+- The minor-version skew relative to the control-plane release must be &lt;= N-2.
+This is not currently enforced, but exceeding this limit is unsupported and
+may lead to unpredictable behavior.
+- If the specified release is higher than the HostedCluster&rsquo;s release, the
+NodePool will be degraded and the ValidReleaseImage condition will be false.
+- If the specified release is lower than the NodePool&rsquo;s current y-stream,
+the NodePool will be degraded and the ValidReleaseImage condition will be false.</p>
+<p>Changing this field triggers a NodePool rollout.</p>
 </td>
 </tr>
 <tr>
@@ -3694,6 +3697,20 @@ WorkloadIdentity
 workload identity authentication.</p>
 </td>
 </tr>
+<tr>
+<td>
+<code>network</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.WorkloadIdentity">
+WorkloadIdentity
+</a>
+</em>
+</td>
+<td>
+<p>network is the client ID of a federated managed identity, associated with cluster-network-operator, used in
+workload identity authentication.</p>
+</td>
+</tr>
 </tbody>
 </table>
 ###CIDRBlock { #hypershift.openshift.io/v1beta1.CIDRBlock }
@@ -3780,8 +3797,13 @@ string
 </em>
 </td>
 <td>
+<em>(Optional)</em>
 <p>id specifies the target Capacity Reservation into which the EC2 instances should be launched.
-Must follow the format: cr- followed by 17 lowercase hexadecimal characters. For example: cr-0123456789abcdef0</p>
+Must follow the format: cr- followed by 17 lowercase hexadecimal characters. For example: cr-0123456789abcdef0
+When empty, no specific Capacity Reservation is targeted.</p>
+<p>When specified, preference cannot be set to &lsquo;None&rsquo; or &lsquo;Open&rsquo; as these
+are mutually exclusive with targeting a specific reservation. Use preference &lsquo;CapacityReservationsOnly&rsquo;
+or omit preference field when targeting a specific reservation.</p>
 </td>
 </tr>
 <tr>
@@ -3796,13 +3818,61 @@ MarketType
 <td>
 <em>(Optional)</em>
 <p>marketType specifies the market type of the CapacityReservation for the EC2 instances. Valid values are OnDemand, CapacityBlocks and omitted:
-&ldquo;OnDemand&rdquo;: EC2 instances run as standard On-Demand instances.
-&ldquo;CapacityBlocks&rdquo;: scheduled pre-purchased compute capacity. Capacity Blocks is recommended when GPUs are needed to support ML workloads.
+- &ldquo;OnDemand&rdquo;: EC2 instances run as standard On-Demand instances.
+- &ldquo;CapacityBlocks&rdquo;: scheduled pre-purchased compute capacity. Capacity Blocks is recommended when GPUs are needed to support ML workloads.
 When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.
 The current default value is CapacityBlocks.</p>
+<p>When set to &lsquo;CapacityBlocks&rsquo;, a specific Capacity Reservation ID must be provided.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>preference</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.CapacityReservationPreference">
+CapacityReservationPreference
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>preference specifies the preference for use of Capacity Reservations by the instance. Valid values include:
+- &ldquo;&rdquo;: No preference (platform default)
+- &ldquo;Open&rdquo;: The instance may make use of open Capacity Reservations that match its AZ and InstanceType
+- &ldquo;None&rdquo;: The instance may not make use of any Capacity Reservations. This is to conserve open reservations for desired workloads
+- &ldquo;CapacityReservationsOnly&rdquo;: The instance will only run if matched or targeted to a Capacity Reservation</p>
+<p>Cannot be set to &lsquo;None&rsquo; or &lsquo;Open&rsquo; when a specific Capacity Reservation ID is provided,
+as targeting a specific reservation is mutually exclusive with these general preference settings.</p>
 </td>
 </tr>
 </tbody>
+</table>
+###CapacityReservationPreference { #hypershift.openshift.io/v1beta1.CapacityReservationPreference }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.CapacityReservationOptions">CapacityReservationOptions</a>)
+</p>
+<p>
+<p>CapacityReservationPreference describes the preferred use of capacity reservations
+of an instance</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr><td><p>&#34;None&#34;</p></td>
+<td><p>CapacityReservationPreferenceNone the instance may not make use of any Capacity Reservations. This is to conserve open reservations for desired workloads</p>
+</td>
+</tr><tr><td><p>&#34;CapacityReservationsOnly&#34;</p></td>
+<td><p>CapacityReservationPreferenceOnly the instance will only run if matched or targeted to a Capacity Reservation</p>
+</td>
+</tr><tr><td><p>&#34;Open&#34;</p></td>
+<td><p>CapacityReservationPreferenceOpen the instance may make use of open Capacity Reservations that match its AZ and InstanceType.</p>
+</td>
+</tr></tbody>
 </table>
 ###CertificateSigningRequestApprovalSpec { #hypershift.openshift.io/v1beta1.CertificateSigningRequestApprovalSpec }
 <p>
@@ -4256,6 +4326,21 @@ Default is false (Multus is enabled).
 This field is immutable.
 This field can only be set to true when NetworkType is &ldquo;Other&rdquo;. Setting it to true
 with any other NetworkType will result in a validation error during cluster creation.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>ovnKubernetesConfig</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.OVNKubernetesConfig">
+OVNKubernetesConfig
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>ovnKubernetesConfig holds OVN-Kubernetes specific configuration.
+This is only consumed when NetworkType is OVNKubernetes.</p>
 </td>
 </tr>
 </tbody>
@@ -4784,6 +4869,41 @@ A failure here is unlikely to resolve without the changing user input.</p>
 and reports missing images if any.</p>
 </td>
 </tr></tbody>
+</table>
+###ConfigurationStatus { #hypershift.openshift.io/v1beta1.ConfigurationStatus }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.HostedClusterStatus">HostedClusterStatus</a>, 
+<a href="#hypershift.openshift.io/v1beta1.HostedControlPlaneStatus">HostedControlPlaneStatus</a>)
+</p>
+<p>
+<p>ConfigurationStatus contains the status of HostedCluster configuration</p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>authentication</code></br>
+<em>
+<a href="https://docs.openshift.com/container-platform/4.10/rest_api/config_apis/config-apis-index.html">
+github.com/openshift/api/config/v1.AuthenticationStatus
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>authentication contains the observed authentication configuration status from the hosted cluster.
+This field reflects the current state of the cluster authentication including OAuth metadata,
+OIDC client status, and other authentication-related configurations.</p>
+</td>
+</tr>
+</tbody>
 </table>
 ###ControlPlaneComponent { #hypershift.openshift.io/v1beta1.ControlPlaneComponent }
 <p>
@@ -6234,6 +6354,20 @@ PlatformStatus
 <p>platform contains platform-specific status of the HostedCluster</p>
 </td>
 </tr>
+<tr>
+<td>
+<code>configuration</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.ConfigurationStatus">
+ConfigurationStatus
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>configuration contains the cluster configuration status of the HostedCluster</p>
+</td>
+</tr>
 </tbody>
 </table>
 ###HostedControlPlaneSpec { #hypershift.openshift.io/v1beta1.HostedControlPlaneSpec }
@@ -6973,6 +7107,20 @@ int
 <td>
 <em>(Optional)</em>
 <p>nodeCount tracks the number of nodes in the HostedControlPlane.</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>configuration</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.ConfigurationStatus">
+ConfigurationStatus
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>configuration contains the cluster configuration status of the HostedCluster</p>
 </td>
 </tr>
 </tbody>
@@ -8785,7 +8933,7 @@ credentialsSecretName must also be unique within the Azure Key Vault. See more d
 <a href="#hypershift.openshift.io/v1beta1.CapacityReservationOptions">CapacityReservationOptions</a>)
 </p>
 <p>
-<p>MarketType describes the market type of the CapacityReservationo for an Instance.</p>
+<p>MarketType describes the market type of the CapacityReservation for an Instance.</p>
 </p>
 <table>
 <thead>
@@ -9410,14 +9558,17 @@ Release
 </em>
 </td>
 <td>
-<p>release specifies the OCP release used for the NodePool. This informs the
-ignition configuration for machines which includes the kubelet version, as well as other platform specific
-machine properties (e.g. an AMI on the AWS platform).
-It&rsquo;s not supported to use a release in a NodePool which minor version skew against the Control Plane release is bigger than N-2. Although there&rsquo;s no enforcement that prevents this from happening.
-Attempting to use a release with a bigger skew might result in unpredictable behaviour.
-Attempting to use a release higher than the HosterCluster one will result in the NodePool being degraded and the ValidReleaseImage condition being false.
-Attempting to use a release lower than the current NodePool y-stream will result in the NodePool being degraded and the ValidReleaseImage condition being false.
-Changing this field will trigger a NodePool rollout.</p>
+<p>release specifies the OCP release used for this NodePool. It drives the machine ignition configuration (including
+the kubelet version) and other platform-specific properties (e.g. an AMI on AWS).</p>
+<p>Version-skew rules and effects:
+- The minor-version skew relative to the control-plane release must be &lt;= N-2.
+This is not currently enforced, but exceeding this limit is unsupported and
+may lead to unpredictable behavior.
+- If the specified release is higher than the HostedCluster&rsquo;s release, the
+NodePool will be degraded and the ValidReleaseImage condition will be false.
+- If the specified release is lower than the NodePool&rsquo;s current y-stream,
+the NodePool will be degraded and the ValidReleaseImage condition will be false.</p>
+<p>Changing this field triggers a NodePool rollout.</p>
 </td>
 </tr>
 <tr>
@@ -9758,6 +9909,99 @@ the guest cluster.</p>
 the management cluster.</p>
 </td>
 </tr></tbody>
+</table>
+###OVNIPv4Config { #hypershift.openshift.io/v1beta1.OVNIPv4Config }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.OVNKubernetesConfig">OVNKubernetesConfig</a>)
+</p>
+<p>
+<p>OVNIPv4Config contains IPv4-specific configuration options for OVN-Kubernetes.
+<a href="https://github.com/openshift/api/blob/6d3c4e25a8d3aeb57ad61649d80c38cbd27d1cc8/operator/v1/types_network.go#L473-L503">https://github.com/openshift/api/blob/6d3c4e25a8d3aeb57ad61649d80c38cbd27d1cc8/operator/v1/types_network.go#L473-L503</a></p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>internalTransitSwitchSubnet</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>internalTransitSwitchSubnet is a v4 subnet in IPV4 CIDR format used internally
+by OVN-Kubernetes for the distributed transit switch in the OVN Interconnect
+architecture that connects the cluster routers on each node together to enable
+east west traffic. The subnet chosen should not overlap with other networks
+specified for OVN-Kubernetes as well as other networks used on the host.
+When omitted, this means no opinion and the platform is left to choose a reasonable
+default which is subject to change over time.
+The current default subnet is 100.88.0.0/16
+The subnet must be large enough to accommodate one IP per node in your cluster
+The value must be in proper IPV4 CIDR format</p>
+</td>
+</tr>
+<tr>
+<td>
+<code>internalJoinSubnet</code></br>
+<em>
+string
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>internalJoinSubnet is a v4 subnet used internally by ovn-kubernetes in case the
+default one is being already used by something else. It must not overlap with
+any other subnet being used by OpenShift or by the node network. The size of the
+subnet must be larger than the number of nodes.
+The current default value is 100.64.0.0/16
+The subnet must be large enough to accommodate one IP per node in your cluster
+The value must be in proper IPV4 CIDR format</p>
+</td>
+</tr>
+</tbody>
+</table>
+###OVNKubernetesConfig { #hypershift.openshift.io/v1beta1.OVNKubernetesConfig }
+<p>
+(<em>Appears on:</em>
+<a href="#hypershift.openshift.io/v1beta1.ClusterNetworkOperatorSpec">ClusterNetworkOperatorSpec</a>)
+</p>
+<p>
+<p>OVNKubernetesConfig contains OVN-Kubernetes specific configuration options.
+<a href="https://github.com/openshift/api/blob/6d3c4e25a8d3aeb57ad61649d80c38cbd27d1cc8/operator/v1/types_network.go#L400-L471">https://github.com/openshift/api/blob/6d3c4e25a8d3aeb57ad61649d80c38cbd27d1cc8/operator/v1/types_network.go#L400-L471</a></p>
+</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<code>ipv4</code></br>
+<em>
+<a href="#hypershift.openshift.io/v1beta1.OVNIPv4Config">
+OVNIPv4Config
+</a>
+</em>
+</td>
+<td>
+<em>(Optional)</em>
+<p>ipv4 allows users to configure IP settings for IPv4 connections. When omitted,
+this means no opinions and the default configuration is used. Check individual
+fields within ipv4 for details of default values.</p>
+</td>
+</tr>
+</tbody>
 </table>
 ###ObjectEncodingFormat { #hypershift.openshift.io/v1beta1.ObjectEncodingFormat }
 <p>
@@ -10250,9 +10494,11 @@ string
 <em>(Optional)</em>
 <p>tenancy indicates if instance should run on shared or single-tenant hardware.</p>
 <p>Possible values:
-default: NodePool instances run on shared hardware.
-dedicated: Each NodePool instance runs on single-tenant hardware.
-host: NodePool instances run on user&rsquo;s pre-allocated dedicated hosts.</p>
+- &ldquo;default&rdquo;: NodePool instances run on shared hardware.
+- &ldquo;dedicated&rdquo;: Each NodePool instance runs on single-tenant hardware (Dedicated Instances).
+- &ldquo;host&rdquo;: NodePool instances run on user&rsquo;s pre-allocated dedicated hosts (Dedicated Hosts).</p>
+<p>When tenancy is set to &ldquo;host&rdquo;, capacityReservation cannot be specified
+as AWS does not support Capacity Reservations with Dedicated Hosts.</p>
 </td>
 </tr>
 <tr>
@@ -10267,6 +10513,8 @@ CapacityReservationOptions
 <td>
 <em>(Optional)</em>
 <p>capacityReservation specifies Capacity Reservation options for the NodePool instances.</p>
+<p>Cannot be specified when tenancy is set to &ldquo;host&rdquo; as Dedicated Hosts
+do not support Capacity Reservations. Compatible with &ldquo;default&rdquo; and &ldquo;dedicated&rdquo; tenancy.</p>
 </td>
 </tr>
 </tbody>

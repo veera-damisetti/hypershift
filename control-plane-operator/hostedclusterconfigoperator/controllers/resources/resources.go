@@ -19,6 +19,7 @@ import (
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/ocm"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/api"
 	alerts "github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/alerts"
+	azureresources "github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/azure"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/cco"
 	ccm "github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/cloudcontrollermanager/azure"
 	"github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/crd"
@@ -288,6 +289,26 @@ func (r *reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 	}
 
 	if !hcp.DeletionTimestamp.IsZero() {
+		// Delete admission policies during cluster deletion to allow HCCO cleanup operations for ARO HCP
+		if hcp.Spec.Platform.Type == hyperv1.AzurePlatform {
+			registryConfigManagementStateAdmissionPolicy := registry.AdmissionPolicy{Name: registry.AdmissionPolicyNameManagementState}
+			// During cluster deletion, delete the admission policy and its binding to allow CIRO cleanup
+			log.Info("Cluster is being deleted, deleting registry management state admission policy and binding to allow cleanup")
+
+			// Delete binding first to avoid dangling reference
+			binding := manifests.ValidatingAdmissionPolicyBinding(fmt.Sprintf("%s-binding", registryConfigManagementStateAdmissionPolicy.Name))
+			_, err := util.DeleteIfNeeded(ctx, r.client, binding)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to delete ValidatingAdmissionPolicyBinding %s: %v", binding.Name, err)
+			}
+
+			// Delete policy
+			vap := manifests.ValidatingAdmissionPolicy(registryConfigManagementStateAdmissionPolicy.Name)
+			if _, err := util.DeleteIfNeeded(ctx, r.client, vap); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to delete ValidatingAdmissionPolicy %s: %v", vap.Name, err)
+			}
+		}
+
 		if shouldCleanupCloudResources(hcp) {
 			log.Info("Cleaning up hosted cluster cloud resources")
 			return r.destroyCloudResources(ctx, hcp)
@@ -569,8 +590,12 @@ func (r *reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 
 	log.Info("reconciling network operator")
 	networkOperator := networkoperator.NetworkOperator()
+	var ovnConfig *hyperv1.OVNKubernetesConfig
+	if hcp.Spec.OperatorConfiguration != nil && hcp.Spec.OperatorConfiguration.ClusterNetworkOperator != nil {
+		ovnConfig = hcp.Spec.OperatorConfiguration.ClusterNetworkOperator.OVNKubernetesConfig
+	}
 	if _, err := r.CreateOrUpdate(ctx, r.client, networkOperator, func() error {
-		networkoperator.ReconcileNetworkOperator(networkOperator, hcp.Spec.Networking.NetworkType, hcp.Spec.Platform.Type, util.IsDisableMultiNetwork(hcp))
+		networkoperator.ReconcileNetworkOperator(networkOperator, hcp.Spec.Networking.NetworkType, hcp.Spec.Platform.Type, util.IsDisableMultiNetwork(hcp), ovnConfig)
 		return nil
 	}); err != nil {
 		errs = append(errs, fmt.Errorf("failed to reconcile network operator: %w", err))
@@ -744,35 +769,44 @@ func (r *reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 
 	// Reconcile hostedCluster recovery if the hosted cluster was restored from backup
 	if _, exists := hcp.Annotations[hyperv1.HostedClusterRestoredFromBackupAnnotation]; exists {
+		var (
+			finished bool
+			err      error
+		)
 		condition := &metav1.Condition{
 			Type:   string(hyperv1.HostedClusterRestoredFromBackup),
 			Reason: hyperv1.RecoveryFinishedReason,
 		}
 
-		if err := r.reconcileRestoredCluster(ctx, hcp); err != nil {
+		finished, err = r.reconcileRestoredCluster(ctx, hcp)
+		if err != nil {
+			log.Error(err, "failed to reconcile hosted cluster recovery")
+			return ctrl.Result{}, errors.NewAggregate(append(errs, err))
+		}
+
+		if !finished {
 			log.Info("hosted cluster recovery not finished yet")
 			condition.Status = metav1.ConditionFalse
-			condition.Message = fmt.Sprintf("Hosted cluster recovery not finished: %v", err)
-
+			condition.Message = "Hosted cluster recovery not finished yet"
 			meta.SetStatusCondition(&hcp.Status.Conditions, *condition)
-			if _, err := r.CreateOrUpdate(ctx, r.client, hcp, func() error {
-				return nil
-			}); err != nil {
+			log.Info("setting condition", "type", condition.Type, "status", condition.Status, "message", condition.Message)
+			if err := r.cpClient.Status().Update(ctx, hcp); err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to update status on hcp for hosted cluster recovery: %w. Condition error message: %v", err, condition.Message)
 			}
+			log.Info("successfully updated hcp status with recovery not finished condition")
 
-			return ctrl.Result{RequeueAfter: 120 * time.Second}, errors.NewAggregate(errs)
+			return ctrl.Result{RequeueAfter: 120 * time.Second}, nil
 		}
 
 		log.Info("hosted cluster recovery finished")
 		condition.Status = metav1.ConditionTrue
 		condition.Message = "Hosted cluster recovery finished"
 		meta.SetStatusCondition(&hcp.Status.Conditions, *condition)
-		if _, err := r.CreateOrUpdate(ctx, r.client, hcp, func() error {
-			return nil
-		}); err != nil {
+		log.Info("setting condition", "type", condition.Type, "status", condition.Status, "message", condition.Message)
+		if err := r.cpClient.Status().Update(ctx, hcp); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update status on hcp for hosted cluster recovery: %w. Condition error message: %v", err, condition.Message)
 		}
+		log.Info("successfully updated hcp status with recovery finished condition")
 	}
 
 	return ctrl.Result{}, errors.NewAggregate(errs)
@@ -1616,6 +1650,7 @@ func (r *reconciler) reconcileCloudCredentialSecrets(ctx context.Context, hcp *h
 			}
 		}
 	case hyperv1.AzurePlatform:
+		// Create a base secret data map with the common Azure credentials
 		secretData := map[string][]byte{
 			"azure_federated_token_file": []byte("/var/run/secrets/openshift/serviceaccount/token"),
 			"azure_region":               []byte(hcp.Spec.Platform.Azure.Location),
@@ -1625,50 +1660,10 @@ func (r *reconciler) reconcileCloudCredentialSecrets(ctx context.Context, hcp *h
 			"azure_tenant_id":            []byte(hcp.Spec.Platform.Azure.TenantID),
 		}
 
-		// The ingress controller fails if this secret is not provided. The controller runs on the control plane side. In managed azure, we are
-		// overriding the Azure credentials authentication method to always use client certificate authentication. This secret is just created
-		// so that the ingress controller does not fail. The data in the secret is never used by the ingress controller due to the aforementioned
-		// override to use client certificate authentication.
-		//
-		// Skip this step if the user explicitly disabled ingress.
-		if capabilities.IsIngressCapabilityEnabled(hcp.Spec.Capabilities) {
-			ingressCredentialSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-ingress-operator", Name: "cloud-credentials"}}
-			if _, err := r.CreateOrUpdate(ctx, r.client, ingressCredentialSecret, func() error {
-				secretData["azure_client_id"] = []byte("fakeClientID")
-				ingressCredentialSecret.Data = secretData
-				return nil
-			}); err != nil {
-				errs = append(errs, fmt.Errorf("failed to reconcile guest cluster ingress operator secret: %w", err))
-			}
-		}
-
-		azureDiskCSISecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-cluster-csi-drivers", Name: "azure-disk-credentials"}}
-		if _, err := r.CreateOrUpdate(ctx, r.client, azureDiskCSISecret, func() error {
-			secretData["azure_client_id"] = []byte(hcp.Spec.Platform.Azure.AzureAuthenticationConfig.ManagedIdentities.DataPlane.DiskMSIClientID)
-			azureDiskCSISecret.Data = secretData
-			return nil
-		}); err != nil {
-			errs = append(errs, fmt.Errorf("failed to reconcile guest cluster CSI secret: %w", err))
-		}
-
-		if capabilities.IsImageRegistryCapabilityEnabled(hcp.Spec.Capabilities) {
-			imageRegistrySecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-image-registry", Name: "installer-cloud-credentials"}}
-			if _, err := r.CreateOrUpdate(ctx, r.client, imageRegistrySecret, func() error {
-				secretData["azure_client_id"] = []byte(hcp.Spec.Platform.Azure.AzureAuthenticationConfig.ManagedIdentities.DataPlane.ImageRegistryMSIClientID)
-				imageRegistrySecret.Data = secretData
-				return nil
-			}); err != nil {
-				errs = append(errs, fmt.Errorf("failed to reconcile guest cluster image-registry secret: %w", err))
-			}
-		}
-
-		azureFileCSISecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-cluster-csi-drivers", Name: "azure-file-credentials"}}
-		if _, err := r.CreateOrUpdate(ctx, r.client, azureFileCSISecret, func() error {
-			secretData["azure_client_id"] = []byte(hcp.Spec.Platform.Azure.AzureAuthenticationConfig.ManagedIdentities.DataPlane.FileMSIClientID)
-			azureFileCSISecret.Data = secretData
-			return nil
-		}); err != nil {
-			errs = append(errs, fmt.Errorf("failed to reconcile csi driver secret: %w", err))
+		// Set up the operand credentials for either managed or self-managed Azure environments
+		errs = azureresources.SetupOperandCredentials(ctx, r.client, r.CreateOrUpdateProvider, hcp, secretData, azureutil.IsAroHCP())
+		if len(errs) > 0 {
+			return errs
 		}
 	case hyperv1.OpenStackPlatform:
 		credentialsSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: hcp.Namespace, Name: hcp.Spec.Platform.OpenStack.IdentityRef.Name}}
@@ -1678,7 +1673,17 @@ func (r *reconciler) reconcileCloudCredentialSecrets(ctx context.Context, hcp *h
 		caCertData := openstack.GetCACertFromCredentialsSecret(credentialsSecret)
 		errs = append(errs,
 			r.reconcileOpenStackCredentialsSecret(ctx, hcp.Spec.Platform.OpenStack, "openshift-cluster-csi-drivers", "openstack-cloud-credentials", credentialsSecret, caCertData, hcp.Spec.Networking.MachineNetwork),
+			// TODO(dkokkino): Remove the manila-cloud-credentials secret from the openshift-cluster-csi-drivers namespace
+			// once https://github.com/openshift/csi-operator/pull/373 merges.The manila-cloud-credentials secret was previously
+			// used by the secretsyncer, which is being removed in that PR. Going forward, Manila will use the manila-cloud-credentials
+			// secret directly in the openshift-manila-csi-driver namespace.
 			r.reconcileOpenStackCredentialsSecret(ctx, hcp.Spec.Platform.OpenStack, "openshift-cluster-csi-drivers", "manila-cloud-credentials", credentialsSecret, caCertData, hcp.Spec.Networking.MachineNetwork),
+			// TODO(dkokkino): Remove the manila-cloud-credentials secret from the openshift-manila-csi-driver namespace
+			// once Manila assets have been migrated to the openshift-cluster-csi-drivers namespace.
+			// Progress is tracked in OSASINFRA-3677.
+			// After the migration, Manila could use the shared secret openstack-cloud-credentials
+			// instead of manila-cloud-credentials.
+			r.reconcileOpenStackCredentialsSecret(ctx, hcp.Spec.Platform.OpenStack, "openshift-manila-csi-driver", "manila-cloud-credentials", credentialsSecret, caCertData, hcp.Spec.Networking.MachineNetwork),
 			r.reconcileOpenStackCredentialsSecret(ctx, hcp.Spec.Platform.OpenStack, "openshift-image-registry", "installer-cloud-credentials", credentialsSecret, caCertData, hcp.Spec.Networking.MachineNetwork),
 			r.reconcileOpenStackCredentialsSecret(ctx, hcp.Spec.Platform.OpenStack, "openshift-cloud-network-config-controller", "cloud-credentials", credentialsSecret, caCertData, hcp.Spec.Networking.MachineNetwork),
 		)
@@ -2219,16 +2224,25 @@ func (r *reconciler) ensureCloudResourcesDestroyed(ctx context.Context, hcp *hyp
 	return remaining, errors.NewAggregate(errs)
 }
 
-func (r *reconciler) reconcileRestoredCluster(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
-	var errs []error
+func (r *reconciler) reconcileRestoredCluster(ctx context.Context, hcp *hyperv1.HostedControlPlane) (bool, error) {
+	var (
+		errs     []error
+		finished bool
+		err      error
+	)
 
 	log := ctrl.LoggerFrom(ctx)
 	log.Info("Ensuring monitoring stack is properly working after hosted cluster restoration")
-	if err := dr.RecoverMonitoringStack(ctx, hcp, r.uncachedClient); err != nil {
-		errs = append(errs, err)
+	if finished, err = dr.RecoverMonitoringStack(ctx, hcp, r.uncachedClient); err != nil {
+		return false, errors.NewAggregate(append(errs, err))
 	}
 
-	return errors.NewAggregate(errs)
+	if finished {
+		log.Info("Monitoring stack is properly working after hosted cluster restoration")
+		return true, nil
+	}
+
+	return false, nil
 }
 
 func (r *reconciler) ensureGuestAdmissionWebhooksAreValid(ctx context.Context) error {
@@ -2740,6 +2754,13 @@ func (r *reconciler) reconcileStorage(ctx context.Context, hcp *hyperv1.HostedCo
 		driverNames = []operatorv1.CSIDriverName{
 			operatorv1.CinderCSIDriver,
 			operatorv1.ManilaCSIDriver,
+		}
+	case hyperv1.AzurePlatform:
+		if azureutil.IsSelfManagedAzure(hcp.Spec.Platform.Type) {
+			driverNames = []operatorv1.CSIDriverName{
+				operatorv1.AzureDiskCSIDriver,
+				operatorv1.AzureFileCSIDriver,
+			}
 		}
 	}
 	for _, driverName := range driverNames {

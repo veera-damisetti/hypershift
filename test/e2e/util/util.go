@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -24,7 +25,7 @@ import (
 	hccomanifests "github.com/openshift/hypershift/control-plane-operator/hostedclusterconfigoperator/controllers/resources/manifests"
 	hcmetrics "github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster/metrics"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests"
-	karpenterassets "github.com/openshift/hypershift/karpenter-operator/controllers/karpenter/assets"
+	"github.com/openshift/hypershift/support/azureutil"
 	"github.com/openshift/hypershift/support/certs"
 	"github.com/openshift/hypershift/support/conditions"
 	suppconfig "github.com/openshift/hypershift/support/config"
@@ -33,6 +34,7 @@ import (
 	hyperutil "github.com/openshift/hypershift/support/util"
 
 	configv1 "github.com/openshift/api/config/v1"
+	operatorv1 "github.com/openshift/api/operator/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	configv1client "github.com/openshift/client-go/config/clientset/versioned"
 	routev1client "github.com/openshift/client-go/route/clientset/versioned"
@@ -73,6 +75,8 @@ import (
 	"github.com/go-logr/zapr"
 	"github.com/google/go-cmp/cmp"
 	prometheusv1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 	"go.uber.org/zap/zaptest"
 )
@@ -576,6 +580,40 @@ func WaitForImageRollout(t *testing.T, ctx context.Context, client crclient.Clie
 	)
 }
 
+func WaitForControlPlaneComponentRollout(t *testing.T, ctx context.Context, client crclient.Client, hostedCluster *hyperv1.HostedCluster, initialVersion string) {
+	controlPlaneComponents := &hyperv1.ControlPlaneComponentList{}
+	controlPlaneNamespace := manifests.HostedControlPlaneNamespace(hostedCluster.Namespace, hostedCluster.Name)
+	EventuallyObjects(t, ctx, "control plane components to complete rollout",
+		func(ctx context.Context) ([]*hyperv1.ControlPlaneComponent, error) {
+			err := client.List(ctx, controlPlaneComponents, crclient.InNamespace(controlPlaneNamespace))
+			items := make([]*hyperv1.ControlPlaneComponent, len(controlPlaneComponents.Items))
+			for i := range controlPlaneComponents.Items {
+				items[i] = &controlPlaneComponents.Items[i]
+			}
+			return items, err
+		},
+		[]Predicate[[]*hyperv1.ControlPlaneComponent]{
+			func(cpComponents []*hyperv1.ControlPlaneComponent) (done bool, reasons string, err error) {
+				return len(cpComponents) > 10, "expecting more than 10 control plane components", nil
+			},
+		},
+		[]Predicate[*hyperv1.ControlPlaneComponent]{
+			ConditionPredicate[*hyperv1.ControlPlaneComponent](Condition{
+				Type:   string(hyperv1.ControlPlaneComponentRolloutComplete),
+				Status: metav1.ConditionTrue,
+			}),
+			func(cpComponent *hyperv1.ControlPlaneComponent) (done bool, reasons string, err error) {
+				if initialVersion != "" && cpComponent.Status.Version == initialVersion {
+					return false, fmt.Sprintf("component %s is still on version %s", cpComponent.Name, cpComponent.Status.Version), nil
+				}
+				return true, fmt.Sprintf("component %s has version: %s", cpComponent.Name, cpComponent.Status.Version), nil
+			},
+		},
+		WithTimeout(30*time.Minute),
+		WithInterval(10*time.Second),
+	)
+}
+
 func WaitForConditionsOnHostedControlPlane(t *testing.T, ctx context.Context, client crclient.Client, hostedCluster *hyperv1.HostedCluster, image string) {
 	var predicates []Predicate[*hyperv1.HostedControlPlane]
 	for _, conditionType := range []hyperv1.ConditionType{
@@ -838,8 +876,11 @@ func EnsureOAPIMountsTrustBundle(t *testing.T, ctx context.Context, mgmtClient c
 			}), "no volume named proxy-additional-trust-bundle found in openshift-apiserver pod")
 		}
 
-		_, err = RunCommandInPod(ctx, mgmtClient, "openshift-apiserver", hcpNs, command, "openshift-apiserver", 0)
-		g.Expect(err).ToNot(HaveOccurred(), "failed to run command in pod: %v", err)
+		// Retry logic to handle timing issues with certificate initialization
+		g.Eventually(func() error {
+			_, err := RunCommandInPod(ctx, mgmtClient, "openshift-apiserver", hcpNs, command, "openshift-apiserver", 1*time.Minute)
+			return err
+		}, 5*time.Minute, 30*time.Second).Should(Succeed(), "ca-bundle.crt file should be available in openshift-apiserver pod")
 	})
 
 }
@@ -912,6 +953,41 @@ func EnsureAllContainersHaveTerminationMessagePolicyFallbackToLogsOnError(t *tes
 	})
 }
 
+// NOTE: This function assumes that it is not called in the middle of a version rollout
+// i.e. It expects that the first entry in ClusterVersion history is Completed
+func EnsureFeatureGateStatus(t *testing.T, ctx context.Context, guestClient crclient.Client) {
+	t.Run("EnsureFeatureGateStatus", func(t *testing.T) {
+		AtLeast(t, Version419)
+
+		g := NewWithT(t)
+
+		clusterVersion := &configv1.ClusterVersion{}
+		err := guestClient.Get(ctx, crclient.ObjectKey{Name: "version"}, clusterVersion)
+		g.Expect(err).NotTo(HaveOccurred(), "failed to get ClusterVersion resource")
+
+		featureGate := &configv1.FeatureGate{}
+		err = guestClient.Get(ctx, crclient.ObjectKey{Name: "cluster"}, featureGate)
+		g.Expect(err).NotTo(HaveOccurred(), "failed to get FeatureGate resource")
+
+		// Expect at least one entry in ClusterVersion history
+		g.Expect(len(clusterVersion.Status.History)).To(BeNumerically(">", 0), "ClusterVersion history is empty")
+		currentVersion := clusterVersion.Status.History[0].Version
+
+		// Expect current version to be in Completed state
+		g.Expect(clusterVersion.Status.History[0].State).To(Equal(configv1.CompletedUpdate), "most recent ClusterVersion history entry is not in Completed state")
+
+		// Ensure that the current version in ClusterVersion is also present in FeatureGate status
+		versionFound := false
+		for _, details := range featureGate.Status.FeatureGates {
+			if details.Version == currentVersion {
+				versionFound = true
+				break
+			}
+		}
+		g.Expect(versionFound).To(BeTrue(), "current version %s from ClusterVersion not found in FeatureGate status", currentVersion)
+	})
+}
+
 func EnsureNodeCountMatchesNodePoolReplicas(t *testing.T, ctx context.Context, hostClient, guestClient crclient.Client, platform hyperv1.PlatformType, nodePoolNamespace string) {
 	t.Run("EnsureNodeCountMatchesNodePoolReplicas", func(t *testing.T) {
 		var nodePoolList hyperv1.NodePoolList
@@ -943,7 +1019,33 @@ func EnsureMachineDeploymentGeneration(t *testing.T, ctx context.Context, hostCl
 
 func EnsurePSANotPrivileged(t *testing.T, ctx context.Context, guestClient crclient.Client) {
 	t.Run("EnsurePSANotPrivileged", func(t *testing.T) {
-		AtLeast(t, Version420)
+		AtLeast(t, Version421)
+
+		// Check if OpenShiftPodSecurityAdmission feature gate is enabled
+		featureGate := &configv1.FeatureGate{}
+		err := guestClient.Get(ctx, crclient.ObjectKey{Name: "cluster"}, featureGate)
+		if err != nil {
+			t.Logf("failed to get FeatureGate resource: %v", err)
+			return
+		}
+
+		// Find the current version and check if OpenShiftPodSecurityAdmission is enabled
+		var psaEnabled bool
+		for _, details := range featureGate.Status.FeatureGates {
+			for _, enabled := range details.Enabled {
+				if enabled.Name == "OpenShiftPodSecurityAdmission" {
+					psaEnabled = true
+					break
+				}
+			}
+			if psaEnabled {
+				break
+			}
+		}
+
+		if !psaEnabled {
+			t.Skip("OpenShiftPodSecurityAdmission feature gate is not enabled, skipping PSA test")
+		}
 		testNamespaceName := "e2e-psa-check"
 		namespace := &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
@@ -968,7 +1070,7 @@ func EnsurePSANotPrivileged(t *testing.T, ctx context.Context, guestClient crcli
 				HostPID: true, // enforcement of restricted or baseline policy should reject this
 			},
 		}
-		err := guestClient.Create(ctx, pod)
+		err = guestClient.Create(ctx, pod)
 		if err == nil {
 			t.Errorf("pod admitted when rejection was expected")
 		}
@@ -1397,8 +1499,27 @@ func RunQueryAtTime(ctx context.Context, log logr.Logger, prometheusClient prome
 	}, nil
 }
 
+// GetMetricsFromPod exec curl command in a pod metrics endpoint and return metric values if any
+// Requires curl to be installed in the container
+func GetMetricsFromPod(ctx context.Context, c crclient.Client, componentName, containerName, namespaceName, port string) (map[string]*dto.MetricFamily, error) {
+	command := []string{"curl", "-s", fmt.Sprintf("http://127.0.0.1:%s/metrics", port)}
+	cmdOutput, err := RunCommandInPod(ctx, c, componentName, namespaceName, command, containerName, 5*time.Minute)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't obtain any metrics: %v", err)
+	}
+	if len(cmdOutput) == 0 {
+		return nil, fmt.Errorf("no metrics found")
+	}
+
+	var parser expfmt.TextParser
+	return parser.TextToMetricFamilies(strings.NewReader(cmdOutput))
+}
+
 func EnsurePodsWithEmptyDirPVsHaveSafeToEvictAnnotations(t *testing.T, ctx context.Context, hostClient crclient.Client, hcpNs string) {
+	AtLeast(t, Version420)
+
 	t.Run("EnsurePodsWithEmptyDirPVsHaveSafeToEvictAnnotations", func(t *testing.T) {
+
 		g := NewWithT(t)
 
 		auditedAppList := map[string]string{
@@ -1469,10 +1590,20 @@ func EnsurePodsWithEmptyDirPVsHaveSafeToEvictAnnotations(t *testing.T, ctx conte
 
 			if labelKey == "" || labelValue == "" {
 				// if the Key/Value are empty we assume that the pod is not in the auditedList,
-				// if that's the case the annotation should not exists in that pod.
+				// if that's the case the annotation should not exists in that pod (except for tmp-dir which is in every pod by default).
 				// Then continue to the next pod
-				g.Expect(pod.Annotations[suppconfig.PodSafeToEvictLocalVolumesKey]).To(BeEmpty(), "the pod  %s is not in the audited list for safe-eviction and should not contain the safe-to-evict-local-volume annotation", pod.Name)
-				continue
+				hasTmpDirAnnotation := false
+				safe2EvictVolumes := strings.Split(pod.Annotations[suppconfig.PodSafeToEvictLocalVolumesKey], ",")
+				safe2EvictVolumes = slices.DeleteFunc(safe2EvictVolumes, func(s string) bool {
+					hasTmpDir := s == util.PodTmpDirMountName
+					hasTmpDirAnnotation = hasTmpDirAnnotation || hasTmpDir
+					return s == "" || hasTmpDir
+				})
+				g.Expect(safe2EvictVolumes).To(BeEmpty(), "the pod  %s is not in the audited list for safe-eviction and should not contain the safe-to-evict-local-volume annotation", pod.Name)
+				// if we have a tmpdir annotation, we need to ensure that the volume is defined correctly; done below
+				if !hasTmpDirAnnotation {
+					continue
+				}
 			}
 
 			annotationValue := pod.ObjectMeta.Annotations[suppconfig.PodSafeToEvictLocalVolumesKey]
@@ -1482,6 +1613,154 @@ func EnsurePodsWithEmptyDirPVsHaveSafeToEvictAnnotations(t *testing.T, ctx conte
 				if (volume.EmptyDir != nil && volume.EmptyDir.Medium != corev1.StorageMediumMemory) || volume.HostPath != nil {
 					g.Expect(strings.Contains(annotationValue, volume.Name)).To(BeTrue(), "pod with name %s do not have the right volumes set in the safe-to-evict-local-volume annotation: \nCurrent: %s, Expected to be included in: %s", pod.Name, volume.Name, annotationValue)
 				}
+			}
+		}
+	})
+}
+
+type labelSelector struct {
+	label string
+	value string
+}
+
+// auditedContainersHas checks the given map to see if the container name exists in it; if the map is empty, always return true
+func auditedContainersHas(container corev1.Container, auditedContainers map[string]struct{}) bool {
+	if auditedContainers == nil {
+		return false
+	}
+
+	if len(auditedContainers) == 0 {
+		return true
+	}
+
+	_, has := auditedContainers[container.Name]
+	return has
+}
+
+func EnsureReadOnlyRootFilesystem(t *testing.T, ctx context.Context, hostClient crclient.Client, hcpNs string) {
+	AtLeast(t, Version420)
+
+	// By default, we enable readOnlyRootFilesystem in every container.
+	// This testchecks to make sure that every container has this field enabled, unless manually specified in auditedAppContainersNoRORFS
+	t.Run("EnsureReadOnlyRootFilesystem", func(t *testing.T) {
+		g := NewWithT(t)
+
+		hcpPods := &corev1.PodList{}
+		if err := hostClient.List(ctx, hcpPods, &client.ListOptions{
+			Namespace: hcpNs,
+		}); err != nil {
+			t.Fatalf("cannot list hostedControlPlane pods: %v", err)
+		}
+
+		// a list of applications that are allowed to have Pod.Spec.Containers[*].SecurityContext.ReadOnlyRootFilesystem == false
+		// auditedAppContainersNoRORFS[labelSelector{label: "app", value: "value"}][pod.Spec.Containers[*]] indicates that particular container is allowed to be false.
+		// if a labelSelector is given with an empty map, allow all containers to be false
+		auditedAppContainersNoRORFS := map[labelSelector]map[string]struct{}{
+			{label: "app", value: "azure-disk-csi-driver-controller"}:       {},
+			{label: "app", value: "azure-disk-csi-driver-operator"}:         {},
+			{label: "app", value: "azure-file-csi-driver-controller"}:       {},
+			{label: "app", value: "azure-file-csi-driver-operator"}:         {},
+			{label: "app", value: "aws-ebs-csi-driver-controller"}:          {},
+			{label: "app", value: "aws-ebs-csi-driver-operator"}:            {},
+			{label: "app", value: "openstack-cinder-csi-driver-operator"}:   {},
+			{label: "app", value: "openstack-cinder-csi-driver-controller"}: {},
+			{label: "app", value: "manila-csi-driver-operator"}:             {},
+			{label: "app", value: "openstack-manila-csi"}:                   {},
+			{label: "app", value: "multus-admission-controller"}:            {},
+			{label: "app", value: "network-node-identity"}:                  {},
+			{label: "app", value: "ovnkube-control-plane"}:                  {},
+			{label: "app", value: "cloud-network-config-controller"}:        {},
+			{label: "app", value: "vmi-console-debug"}:                      {},
+			{label: "kubevirt.io", value: "virt-launcher"}:                  {}, // virt-launcher pods have no app label
+		}
+
+		for _, pod := range hcpPods.Items {
+			// skip etcd and feature-gate-generator pods
+			// If added to the list of audited pods,it will fail the e2e check on older release branches since e2e is ran from main.
+			if componentName := pod.Labels["hypershift.openshift.io/control-plane-component"]; componentName == "etcd" || componentName == "featuregate-generator" {
+				continue
+			}
+
+			var auditedContainers map[string]struct{}
+
+			for selector, containers := range auditedAppContainersNoRORFS {
+				if v, has := pod.Labels[selector.label]; has && v == selector.value {
+					auditedContainers = containers
+					break
+				}
+			}
+
+			for _, c := range pod.Spec.Containers {
+				isAuditedOff := auditedContainersHas(c, auditedContainers)
+				isRORFS := c.SecurityContext != nil && c.SecurityContext.ReadOnlyRootFilesystem != nil && *c.SecurityContext.ReadOnlyRootFilesystem
+
+				// valid cases are isAuditedOff && !isRORFS and !isAuditedOff && isRORFS
+				g.Expect(isRORFS).ToNot(BeIdenticalTo(isAuditedOff), "container %s in pod %s expects readOnlyRootFilesystem to be %v, it was %v", c.Name, pod.Name, !isAuditedOff, isRORFS)
+			}
+		}
+	})
+
+	// By default, we add an emptyDir pod volume and mount it into every container in the pod at /tmp.
+	// This test checks to make sure that every container has this mount, unless manually specified in auditedAppContainerNoTmpDir.
+	t.Run("EnsureReadOnlyRootFilesystemTmpDirMount", func(t *testing.T) {
+		g := NewWithT(t)
+
+		hcpPods := &corev1.PodList{}
+		if err := hostClient.List(ctx, hcpPods, &client.ListOptions{
+			Namespace: hcpNs,
+		}); err != nil {
+			t.Fatalf("cannot list hostedControlPlane pods: %v", err)
+		}
+
+		// a list of applications that are allowed to not have the emptyDir "tmp-dir" mounted.
+		// auditedAppContainerNoTmpDir[labelSelector{label: "app", value: "value"}][pod.Spec.Containers[*]] indicates that particular container is allowed to not have the mount
+		// if a labelSelector is given with an empty map, allow all containers to not have it
+		auditedAppContainerNoTmpDir := map[labelSelector]map[string]struct{}{
+			{label: "app", value: "azure-disk-csi-driver-controller"}:       {},
+			{label: "app", value: "azure-disk-csi-driver-operator"}:         {},
+			{label: "app", value: "azure-file-csi-driver-controller"}:       {},
+			{label: "app", value: "azure-file-csi-driver-operator"}:         {},
+			{label: "app", value: "aws-ebs-csi-driver-controller"}:          {},
+			{label: "app", value: "aws-ebs-csi-driver-operator"}:            {},
+			{label: "app", value: "openstack-cinder-csi-driver-controller"}: {},
+			{label: "app", value: "openstack-manila-csi"}:                   {},
+			{label: "app", value: "multus-admission-controller"}:            {},
+			{label: "app", value: "network-node-identity"}:                  {},
+			{label: "app", value: "ovnkube-control-plane"}:                  {},
+			{label: "app", value: "cloud-network-config-controller"}:        {},
+			{label: "app", value: "vmi-console-debug"}:                      {},
+			{label: "kubevirt.io", value: "virt-launcher"}:                  {}, // virt-launcher pods have no app label
+			{label: "app", value: "csi-snapshot-controller"}:                {},
+			{label: "app", value: "csi-snapshot-webhook"}:                   {},
+			{label: "app", value: "packageserver"}: {
+				"packageserver": {}, // the package server was able to enabled readOnlyRootFilesystem without needing to mount /tmp
+			},
+		}
+
+		for _, pod := range hcpPods.Items {
+			// skip etcd and feature-gate-generator pods
+			// If added to the list of audited pods,it will fail the e2e check on older release branches since e2e is ran from main.
+			if componentName := pod.Labels["hypershift.openshift.io/control-plane-component"]; componentName == "etcd" || componentName == "featuregate-generator" {
+				continue
+			}
+
+			var auditedContainers map[string]struct{}
+
+			for selector, containers := range auditedAppContainerNoTmpDir {
+				if v, has := pod.Labels[selector.label]; has && v == selector.value {
+					auditedContainers = containers
+					break
+				}
+			}
+
+			for _, c := range pod.Spec.Containers {
+				if auditedContainersHas(c, auditedContainers) {
+					continue
+				}
+				containerHasTmpDir := slices.ContainsFunc(c.VolumeMounts, func(v corev1.VolumeMount) bool {
+					return v.MountPath == util.PodTmpDirMountPath
+				})
+				g.Expect(containerHasTmpDir).To(BeTrue(), "container %s in pod %s does not have /tmp mounted, and it is expected to mount it", c.Name, pod.Name)
 			}
 		}
 	})
@@ -1541,8 +1820,14 @@ func EnsureGuestWebhooksValidated(t *testing.T, ctx context.Context, guestClient
 func EnsureGlobalPullSecret(t *testing.T, ctx context.Context, mgmtClient crclient.Client, entryHostedCluster *hyperv1.HostedCluster) error {
 	t.Run("EnsureGlobalPullSecret", func(t *testing.T) {
 		AtLeast(t, Version419)
-		if entryHostedCluster.Spec.Platform.Type != hyperv1.AzurePlatform {
-			t.Skip("test only supported on platform ARO")
+		// TODO (jparrill): Change check of release version `releaseVersion.GT(Version420)` to `releaseVersion.GE(Version420)`
+		// during the backport to 4.20 of this PR https://github.com/openshift/hypershift/pull/6736
+		if entryHostedCluster.Spec.Platform.Type != hyperv1.AzurePlatform && entryHostedCluster.Spec.Platform.Type != hyperv1.AWSPlatform {
+			t.Skip("test only supported on platform ARO or AWS")
+		}
+
+		if entryHostedCluster.Spec.Platform.Type == hyperv1.AWSPlatform && releaseVersion.LE(Version420) {
+			t.Skip("AWS platform not supported on version 4.20 or less")
 		}
 
 		var (
@@ -1713,6 +1998,29 @@ func EnsureGlobalPullSecret(t *testing.T, ctx context.Context, mgmtClient crclie
 				}
 				return fmt.Errorf("global-pull-secret secret is still present")
 			}, 30*time.Second, 5*time.Second).Should(Succeed(), "global-pull-secret secret is still present")
+		})
+
+		// Wait for all nodes to stabilize after global-pull-secret deletion
+		t.Run("Wait for pull secret synchronization to stabilize across all nodes", func(t *testing.T) {
+			t.Log("Waiting for GlobalPullSecretDaemonSet to process the deletion and stabilize all nodes")
+
+			// Wait for the GlobalPullSecretDaemonSet to be ready and stable after processing the deletion
+			EventuallyObject(t, ctx, "GlobalPullSecretDaemonSet to be ready after global-pull-secret deletion", func(ctx context.Context) (*appsv1.DaemonSet, error) {
+				ds := hccomanifests.GlobalPullSecretDaemonSet()
+				err := guestClient.Get(ctx, crclient.ObjectKey{Name: ds.Name, Namespace: ds.Namespace}, ds)
+				return ds, err
+			}, []Predicate[*appsv1.DaemonSet]{func(ds *appsv1.DaemonSet) (done bool, reasons string, err error) {
+				if ds.Status.ObservedGeneration < ds.Generation {
+					return false, fmt.Sprintf("DaemonSet status has not observed generation %d yet (current %d)", ds.Generation, ds.Status.ObservedGeneration), nil
+				}
+				if ds.Status.UpdatedNumberScheduled != ds.Status.DesiredNumberScheduled {
+					return false, fmt.Sprintf("DaemonSet update in flight: %d/%d pods updated", ds.Status.UpdatedNumberScheduled, ds.Status.DesiredNumberScheduled), nil
+				}
+				if ds.Status.NumberReady != ds.Status.DesiredNumberScheduled {
+					return false, fmt.Sprintf("DaemonSet not ready: %d/%d pods ready", ds.Status.NumberReady, ds.Status.DesiredNumberScheduled), nil
+				}
+				return true, fmt.Sprintf("DaemonSet ready: %d/%d pods", ds.Status.NumberReady, ds.Status.DesiredNumberScheduled), nil
+			}}, WithTimeout(5*time.Minute), WithInterval(10*time.Second))
 		})
 
 		// Check if the config.json is updated in all of the nodes
@@ -2201,9 +2509,46 @@ const (
 	HypershiftOperatorInfoName = "hypershift_operator_info"
 )
 
+func extractDataFromFamilies(metricFamilies map[string]*dto.MetricFamily, metric, labelKey, labelValue string) []*dto.LabelPair {
+	v, ok := metricFamilies[metric]
+	if !ok {
+		return nil
+	}
+	labelPairs := []*dto.LabelPair{}
+	for _, m := range v.Metric {
+		for _, l := range m.GetLabel() {
+			if l == nil {
+				continue
+			}
+			if len(labelKey) == 0 || (l.GetName() == labelKey && l.GetValue() == labelValue) {
+				labelPairs = append(labelPairs, l)
+			}
+		}
+	}
+	return labelPairs
+}
+
+// ValidateMetricPresence checks if a metric meets the expected presence criteria
+// Returns true if validation passes, false otherwise
+func ValidateMetricPresence(t *testing.T, mf map[string]*dto.MetricFamily, query, labelKey, labelValue, metricName string, areMetricsExpectedToBePresent bool) bool {
+	labelPairs := extractDataFromFamilies(mf, query, labelKey, labelValue)
+	if areMetricsExpectedToBePresent {
+		if len(labelPairs) < 1 {
+			t.Logf("Expected results for metric %q, found none", metricName)
+			return false
+		}
+	} else {
+		if len(labelPairs) > 0 {
+			t.Logf("Expected 0 results for metric %q, found %d", metricName, len(labelPairs))
+			return false
+		}
+	}
+	return true
+}
+
 // Verifies that the given metrics are defined for the given hosted cluster if areMetricsExpectedToBePresent is set to true.
 // Verifies that the given metrics are not defined otherwise.
-func ValidateMetrics(t *testing.T, ctx context.Context, hc *hyperv1.HostedCluster, metricsNames []string, areMetricsExpectedToBePresent bool) {
+func ValidateMetrics(t *testing.T, ctx context.Context, client crclient.Client, hc *hyperv1.HostedCluster, metricsNames []string, areMetricsExpectedToBePresent bool) {
 	t.Run("ValidateMetricsAreExposed", func(t *testing.T) {
 		// TODO (alberto) this test should pass in None.
 		// https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com/gcs/origin-ci-test/pr-logs/pull/openshift_hypershift/2459/pull-ci-openshift-hypershift-main-e2e-aws/1650438383060652032/artifacts/e2e-aws/run-e2e/artifacts/TestNoneCreateCluster_PreTeardownClusterDump/
@@ -2213,61 +2558,47 @@ func ValidateMetrics(t *testing.T, ctx context.Context, hc *hyperv1.HostedCluste
 			t.Skip("skipping on None platform")
 		}
 
-		if hc.Spec.Platform.Type == hyperv1.AzurePlatform {
-			t.Skip("skipping on Azure platform")
-		}
-
-		g := NewWithT(t)
-
-		prometheusClient, err := NewPrometheusClient(ctx)
-		g.Expect(err).ToNot(HaveOccurred())
-
 		// Polling to prevent races with prometheus scrape interval.
-		err = wait.PollUntilContextTimeout(ctx, 10*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+		err := wait.PollUntilContextTimeout(ctx, 10*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+			// exec curl command in HO pod metrics endpoint and return metric values if any
+			mf, err := GetMetricsFromPod(ctx, client, "operator", "operator", "hypershift", "9000")
+			if err != nil {
+				t.Logf("unable to get exportedMetrics from hypershift-operator: %v", err)
+				return false, nil
+			}
 			for _, metricName := range metricsNames {
-				// Query fo HC specific metrics by hc.name.
-				query := fmt.Sprintf("%v{name=\"%s\"}", metricName, hc.Name)
+				query := metricName
+				labelKey := "name"
+				labelValue := hc.Name
 				if metricName == HypershiftOperatorInfoName {
-					// Query HO info metric
-					query = HypershiftOperatorInfoName
+					query = metricName
+					labelKey, labelValue = "", ""
 				}
 				if strings.HasPrefix(metricName, "hypershift_nodepools") {
-					query = fmt.Sprintf("%v{cluster_name=\"%s\"}", metricName, hc.Name)
+					query = metricName
+					labelKey, labelValue = "cluster_name", hc.Name
 				}
 				// upgrade metric is only available for TestUpgradeControlPlane
 				if metricName == hcmetrics.UpgradingDurationMetricName && !strings.HasPrefix("TestUpgradeControlPlane", t.Name()) {
 					continue
 				}
-				// Karpenter related metrics
-				if metricName == karpenterassets.KarpenterBuildInfoMetricName || metricName == karpenterassets.KarpenterOperatorInfoMetricName {
-					if hc.Spec.AutoNode == nil || hc.Spec.AutoNode.Provisioner.Name != hyperv1.ProvisionerKarpeneter ||
-						hc.Spec.AutoNode.Provisioner.Karpenter.Platform != hyperv1.AWSPlatform || hc.Status.KubeConfig == nil {
+
+				if metricName == hcmetrics.HostedClusterManagedAzureInfoMetricName {
+					if !(azureutil.IsAroHCP()) { // only for ARO
 						continue
 					}
 					query = metricName
+					labelKey, labelValue = "", ""
 				}
 
-				result, err := RunQueryAtTime(ctx, NewLogr(t), prometheusClient, query, time.Now())
-				if err != nil {
-					return false, err
-				}
-
-				if areMetricsExpectedToBePresent {
-					if len(result.Data.Result) < 1 {
-						t.Logf("Expected results for metric %q, found none", metricName)
-						return false, nil
-					}
-				} else {
-					if len(result.Data.Result) > 0 {
-						t.Logf("Expected 0 results for metric %q, found %d", metricName, len(result.Data.Result))
-						return false, nil
-					}
+				if !ValidateMetricPresence(t, mf, query, labelKey, labelValue, metricName, areMetricsExpectedToBePresent) {
+					return false, nil
 				}
 			}
 			return true, nil
 		})
 		if err != nil {
-			t.Errorf("Failed to validate all metrics")
+			t.Errorf("Failed to validate all metrics: %v", err)
 		}
 	})
 }
@@ -2404,7 +2735,13 @@ func ValidatePublicCluster(t *testing.T, ctx context.Context, client crclient.Cl
 		g.Expect(hostedCluster.Status.ControlPlaneEndpoint.Host).ToNot(ContainSubstring("hypershift.local"))
 	}
 
-	ValidateHostedClusterConditions(t, ctx, client, hostedCluster, numNodes > 0, 10*time.Minute)
+	// Extend the timeout to 20 minutes if there are no worker nodes as
+	// 10 minutes might not be enough if image pulls are slow.
+	timeout := 10 * time.Minute
+	if numNodes == 0 {
+		timeout = 20 * time.Minute
+	}
+	ValidateHostedClusterConditions(t, ctx, client, hostedCluster, numNodes > 0, timeout)
 
 	EnsureNodeCountMatchesNodePoolReplicas(t, ctx, client, guestClient, hostedCluster.Spec.Platform.Type, hostedCluster.Namespace)
 	EnsureNoCrashingPods(t, ctx, client, hostedCluster)
@@ -2447,7 +2784,13 @@ func ValidatePrivateCluster(t *testing.T, ctx context.Context, client crclient.C
 		g.Expect(hostedCluster.Status.ControlPlaneEndpoint.Host).ToNot(ContainSubstring("hypershift.local"))
 	}
 
-	ValidateHostedClusterConditions(t, ctx, client, hostedCluster, numNodes > 0, 10*time.Minute)
+	// Extend the timeout to 20 minutes if there are no worker nodes as
+	// 10 minutes might not be enough if image pulls are slow.
+	timeout := 10 * time.Minute
+	if numNodes == 0 {
+		timeout = 20 * time.Minute
+	}
+	ValidateHostedClusterConditions(t, ctx, client, hostedCluster, numNodes > 0, timeout)
 
 	EnsureNoCrashingPods(t, ctx, client, hostedCluster)
 	EnsureOAPIMountsTrustBundle(t, context.Background(), client, hostedCluster)
@@ -2460,19 +2803,17 @@ func ValidatePrivateCluster(t *testing.T, ctx context.Context, client crclient.C
 
 func ValidateHostedClusterConditions(t *testing.T, ctx context.Context, client crclient.Client, hostedCluster *hyperv1.HostedCluster, hasWorkerNodes bool, timeout time.Duration) {
 	expectedConditions := conditions.ExpectedHCConditions(hostedCluster)
+	// OCPBUGS-59885: Ignore KubeVirtNodesLiveMigratable in e2e; CI envs may lack RWX-capable PVCs, causing false failures
+	delete(expectedConditions, hyperv1.KubeVirtNodesLiveMigratable)
 	if !hasWorkerNodes {
 		expectedConditions[hyperv1.ClusterVersionAvailable] = metav1.ConditionFalse
 		expectedConditions[hyperv1.ClusterVersionSucceeding] = metav1.ConditionFalse
 		expectedConditions[hyperv1.ClusterVersionProgressing] = metav1.ConditionTrue
 		delete(expectedConditions, hyperv1.ValidKubeVirtInfraNetworkMTU)
-		delete(expectedConditions, hyperv1.KubeVirtNodesLiveMigratable)
 	}
 	if IsLessThan(Version415) {
 		// ValidKubeVirtInfraNetworkMTU condition is not present in versions < 4.15
 		delete(expectedConditions, hyperv1.ValidKubeVirtInfraNetworkMTU)
-	}
-	if IsLessThan(Version417) {
-		delete(expectedConditions, hyperv1.KubeVirtNodesLiveMigratable)
 	}
 
 	var predicates []Predicate[*hyperv1.HostedCluster]
@@ -2851,7 +3192,7 @@ func EnsureCustomTolerations(t *testing.T, ctx context.Context, client crclient.
 
 func EnsureAppLabel(t *testing.T, ctx context.Context, client crclient.Client, hostedCluster *hyperv1.HostedCluster) {
 	t.Run("EnsureAppLabel", func(t *testing.T) {
-		AtLeast(t, Version420)
+		AtLeast(t, Version419)
 
 		hcpNamespace := manifests.HostedControlPlaneNamespace(hostedCluster.Namespace, hostedCluster.Name)
 		podList := &corev1.PodList{}
@@ -3428,5 +3769,117 @@ func EnsureSecurityContextUID(t *testing.T, ctx context.Context, client crclient
 			t.Logf("All %d pods in namespace %s have the expected RunAsUser UID %d", len(podList.Items), namespaceName, expectedUID)
 		}
 		g.Expect(errs).To(BeEmpty(), "Pods with mismatched RunAsUser:\n%s", strings.Join(errs, "\n"))
+	})
+}
+
+// EnsureCNOOperatorConfiguration tests that changes to the CNO operator configuration on the HostedCluster are
+// properly reflected in the hosted cluster's API and that the CNO doesn't report any errors via HCP conditions.
+func EnsureCNOOperatorConfiguration(t *testing.T, ctx context.Context, mgmtClient crclient.Client, guestClient crclient.Client, hostedCluster *hyperv1.HostedCluster) {
+	t.Run("EnsureCNOOperatorConfiguration", func(t *testing.T) {
+		AtLeast(t, Version420)
+		g := NewWithT(t)
+		const newJoinSubnet = "100.99.0.0/16"
+		const newTransitSwitchSubnet = "100.100.0.0/16"
+		// Update the HostedCluster to configure CNO settings
+		t.Logf("Updating HostedCluster %s/%s with custom OVN internal subnets", hostedCluster.Namespace, hostedCluster.Name)
+		err := UpdateObject(t, ctx, mgmtClient, hostedCluster, func(obj *hyperv1.HostedCluster) {
+			if obj.Spec.OperatorConfiguration == nil {
+				obj.Spec.OperatorConfiguration = &hyperv1.OperatorConfiguration{}
+			}
+			if obj.Spec.OperatorConfiguration.ClusterNetworkOperator == nil {
+				obj.Spec.OperatorConfiguration.ClusterNetworkOperator = &hyperv1.ClusterNetworkOperatorSpec{}
+			}
+			if obj.Spec.OperatorConfiguration.ClusterNetworkOperator.OVNKubernetesConfig == nil {
+				obj.Spec.OperatorConfiguration.ClusterNetworkOperator.OVNKubernetesConfig = &hyperv1.OVNKubernetesConfig{}
+			}
+			if obj.Spec.OperatorConfiguration.ClusterNetworkOperator.OVNKubernetesConfig.IPv4 == nil {
+				obj.Spec.OperatorConfiguration.ClusterNetworkOperator.OVNKubernetesConfig.IPv4 = &hyperv1.OVNIPv4Config{}
+			}
+			// Set the custom subnet values.
+			obj.Spec.OperatorConfiguration.ClusterNetworkOperator.OVNKubernetesConfig.IPv4.InternalJoinSubnet = newJoinSubnet
+			obj.Spec.OperatorConfiguration.ClusterNetworkOperator.OVNKubernetesConfig.IPv4.InternalTransitSwitchSubnet = newTransitSwitchSubnet
+		})
+		g.Expect(err).NotTo(HaveOccurred(), "failed to update HostedCluster with custom OVN config")
+		t.Logf("Validating CNO conditions on HostedControlPlane")
+		hcpNamespace := fmt.Sprintf("%s-%s", hostedCluster.Namespace, hostedCluster.Name)
+		EventuallyObject(t, ctx, fmt.Sprintf("HostedControlPlane %s/%s to have healthy CNO conditions", hcpNamespace, hostedCluster.Name),
+			func(ctx context.Context) (*hyperv1.HostedControlPlane, error) {
+				hcp := &hyperv1.HostedControlPlane{}
+				err := mgmtClient.Get(ctx, types.NamespacedName{
+					Namespace: hcpNamespace,
+					Name:      hostedCluster.Name,
+				}, hcp)
+				return hcp, err
+			},
+			[]Predicate[*hyperv1.HostedControlPlane]{
+				ConditionPredicate[*hyperv1.HostedControlPlane](Condition{
+					Type:   "network.operator.openshift.io/Available",
+					Status: metav1.ConditionTrue,
+				}),
+				ConditionPredicate[*hyperv1.HostedControlPlane](Condition{
+					Type:   "network.operator.openshift.io/Progressing",
+					Status: metav1.ConditionFalse,
+				}),
+				ConditionPredicate[*hyperv1.HostedControlPlane](Condition{
+					Type:   "network.operator.openshift.io/Degraded",
+					Status: metav1.ConditionFalse,
+				}),
+			},
+			WithTimeout(10*time.Minute),
+		)
+		ValidateHostedClusterConditions(t, ctx, mgmtClient, hostedCluster, true, 5*time.Minute)
+		// Check that the Network.operator.openshift.io resource in the guest cluster reflects our changes
+		EventuallyObject(t, ctx, "Network.operator.openshift.io/cluster in guest cluster to reflect the custom subnet changes",
+			func(ctx context.Context) (*operatorv1.Network, error) {
+				network := &operatorv1.Network{}
+				err := guestClient.Get(ctx, types.NamespacedName{Name: "cluster"}, network)
+				return network, err
+			},
+			[]Predicate[*operatorv1.Network]{
+				func(network *operatorv1.Network) (done bool, reasons string, err error) {
+					// Validate that OVN-Kubernetes is properly configured
+					if network.Spec.DefaultNetwork.Type != operatorv1.NetworkTypeOVNKubernetes {
+						return false, fmt.Sprintf("expected network type OVNKubernetes, got %s", network.Spec.DefaultNetwork.Type), nil
+					}
+					if network.Spec.DefaultNetwork.OVNKubernetesConfig == nil {
+						return false, "OVNKubernetesConfig is nil in the reconciled Network CR", nil
+					}
+					if network.Spec.DefaultNetwork.OVNKubernetesConfig.IPv4 == nil {
+						return false, "OVNKubernetesConfig.IPv4 is nil in the reconciled Network CR", nil
+					}
+					if network.Spec.DefaultNetwork.OVNKubernetesConfig.IPv4.InternalJoinSubnet != newJoinSubnet {
+						return false, fmt.Sprintf("expected InternalJoinSubnet to be %s, but got %s", newJoinSubnet, network.Spec.DefaultNetwork.OVNKubernetesConfig.IPv4.InternalJoinSubnet), nil
+					}
+					if network.Spec.DefaultNetwork.OVNKubernetesConfig.IPv4.InternalTransitSwitchSubnet != newTransitSwitchSubnet {
+						return false, fmt.Sprintf("expected InternalTransitSwitchSubnet to be %s, but got %s", newTransitSwitchSubnet, network.Spec.DefaultNetwork.OVNKubernetesConfig.IPv4.InternalTransitSwitchSubnet), nil
+					}
+
+					return true, "Successfully validated custom OVN subnets", nil
+				},
+			},
+			WithTimeout(5*time.Minute),
+		)
+		EventuallyObject(t, ctx, "Network.config.openshift.io/cluster in guest cluster to be available",
+			func(ctx context.Context) (*configv1.Network, error) {
+				network := &configv1.Network{}
+				err := guestClient.Get(ctx, types.NamespacedName{Name: "cluster"}, network)
+				return network, err
+			},
+			[]Predicate[*configv1.Network]{
+				func(network *configv1.Network) (done bool, reasons string, err error) {
+					if network.Status.NetworkType == "" {
+						return false, "NetworkType is not set in status", nil
+					}
+					if len(network.Status.ClusterNetwork) == 0 {
+						return false, "ClusterNetwork is empty in status", nil
+					}
+					if len(network.Status.ServiceNetwork) == 0 {
+						return false, "ServiceNetwork is empty in status", nil
+					}
+					return true, "", nil
+				},
+			},
+			WithTimeout(3*time.Minute),
+		)
 	})
 }

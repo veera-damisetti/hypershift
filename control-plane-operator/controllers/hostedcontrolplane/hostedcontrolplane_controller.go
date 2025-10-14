@@ -77,6 +77,7 @@ import (
 	component "github.com/openshift/hypershift/support/controlplane-component"
 	"github.com/openshift/hypershift/support/events"
 	"github.com/openshift/hypershift/support/globalconfig"
+	karpenterutil "github.com/openshift/hypershift/support/karpenter"
 	"github.com/openshift/hypershift/support/metrics"
 	"github.com/openshift/hypershift/support/releaseinfo"
 	"github.com/openshift/hypershift/support/upsert"
@@ -145,7 +146,8 @@ const (
 	hcpReadyRequeueInterval    = 1 * time.Minute
 	hcpNotReadyRequeueInterval = 15 * time.Second
 
-	azureCredentials = "AzureCredentials"
+	cpoAzureCredentials = "CPOAzureCredentials"
+	kmsAzureCredentials = "KMSAzureCredentials"
 )
 
 type HostedControlPlaneReconciler struct {
@@ -178,7 +180,8 @@ type HostedControlPlaneReconciler struct {
 	reconcileInfrastructureStatus           func(ctx context.Context, hcp *hyperv1.HostedControlPlane) (infra.InfrastructureStatus, error)
 	EnableCVOManagementClusterMetricsAccess bool
 	ImageMetadataProvider                   util.ImageMetadataProvider
-	azureCredentialsLoaded                  sync.Map
+	cpoAzureCredentialsLoaded               sync.Map
+	kmsAzureCredentialsLoaded               sync.Map
 }
 
 func (r *HostedControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager, createOrUpdate upsert.CreateOrUpdateFN, hcp *hyperv1.HostedControlPlane) error {
@@ -962,11 +965,6 @@ func (r *HostedControlPlaneReconciler) update(ctx context.Context, hostedControl
 	userReleaseImageProvider := imageprovider.New(userReleaseImage)
 	releaseImageProvider := imageprovider.New(releaseImage)
 
-	// Keep for now, until the switch to cpov2 is complete and validated.
-	// if err := r.reconcile(ctx, hostedControlPlane, createOrUpdate, releaseImageProvider, userReleaseImageProvider, infraStatus); err != nil {
-	// 	errs = append(errs, err)
-	// }
-
 	var errs []error
 	if err := r.reconcileCPOV2(ctx, hostedControlPlane, infraStatus, releaseImageProvider, userReleaseImageProvider); err != nil {
 		errs = append(errs, err)
@@ -1006,6 +1004,10 @@ func (r *HostedControlPlaneReconciler) update(ctx context.Context, hostedControl
 
 func (r *HostedControlPlaneReconciler) reconcileCPOV2(ctx context.Context, hcp *hyperv1.HostedControlPlane, infraStatus infra.InfrastructureStatus, releaseImageProvider, userReleaseImageProvider imageprovider.ReleaseImageProvider) error {
 	if err := r.cleanupOldKonnectivityServerDeployment(ctx, hcp); err != nil {
+		return err
+	}
+
+	if err := r.cleanupOldPKIOperatorDeployment(ctx, hcp); err != nil {
 		return err
 	}
 
@@ -1124,11 +1126,7 @@ func useHCPRouter(hostedControlPlane *hyperv1.HostedControlPlane) bool {
 	if sharedingress.UseSharedIngress() {
 		return false
 	}
-	return labelHCPRoutes(hostedControlPlane)
-}
-
-func labelHCPRoutes(hcp *hyperv1.HostedControlPlane) bool {
-	return util.IsPrivateHCP(hcp) || util.IsPublicKASWithDNS(hcp)
+	return util.IsPrivateHCP(hostedControlPlane) || util.IsPublicWithDNS(hostedControlPlane)
 }
 
 func IsStorageAndCSIManaged(hostedControlPlane *hyperv1.HostedControlPlane) bool {
@@ -1282,7 +1280,7 @@ func (r *HostedControlPlaneReconciler) reconcileKonnectivityServerService(ctx co
 			if serviceStrategy.Route != nil {
 				hostname = serviceStrategy.Route.Hostname
 			}
-			return kas.ReconcileKonnectivityExternalRoute(konnectivityRoute, p.OwnerRef, hostname, r.DefaultIngressDomain, labelHCPRoutes(hcp))
+			return kas.ReconcileKonnectivityExternalRoute(konnectivityRoute, p.OwnerRef, hostname, r.DefaultIngressDomain, util.UseDedicatedDNSForKonnectivity(hcp))
 		}); err != nil {
 			return fmt.Errorf("failed to reconcile Konnectivity server external route: %w", err)
 		}
@@ -1320,7 +1318,7 @@ func (r *HostedControlPlaneReconciler) reconcileOAuthServerService(ctx context.C
 			if serviceStrategy.Route != nil {
 				hostname = serviceStrategy.Route.Hostname
 			}
-			return oauth.ReconcileExternalPublicRoute(oauthExternalPublicRoute, p.OwnerRef, hostname, r.DefaultIngressDomain, labelHCPRoutes(hcp))
+			return oauth.ReconcileExternalPublicRoute(oauthExternalPublicRoute, p.OwnerRef, hostname, r.DefaultIngressDomain, util.UseDedicatedDNSForOAuth(hcp))
 		}); err != nil {
 			return fmt.Errorf("failed to reconcile OAuth external public route: %w", err)
 		}
@@ -1334,7 +1332,7 @@ func (r *HostedControlPlaneReconciler) reconcileOAuthServerService(ctx context.C
 		// Reconcile the external private route if a hostname is specified
 		if serviceStrategy.Route != nil && serviceStrategy.Route.Hostname != "" {
 			if _, err := createOrUpdate(ctx, r.Client, oauthExternalPrivateRoute, func() error {
-				return oauth.ReconcileExternalPrivateRoute(oauthExternalPrivateRoute, p.OwnerRef, serviceStrategy.Route.Hostname, r.DefaultIngressDomain, labelHCPRoutes(hcp))
+				return oauth.ReconcileExternalPrivateRoute(oauthExternalPrivateRoute, p.OwnerRef, serviceStrategy.Route.Hostname, r.DefaultIngressDomain, util.UseDedicatedDNSForOAuth(hcp))
 			}); err != nil {
 				return fmt.Errorf("failed to reconcile OAuth external private route: %w", err)
 			}
@@ -1395,7 +1393,6 @@ func (r *HostedControlPlaneReconciler) reconcileHCPRouterServices(ctx context.Co
 	if sharedingress.UseSharedIngress() || hcp.Spec.Platform.Type == hyperv1.IBMCloudPlatform {
 		return nil
 	}
-	exposeKASThroughRouter := util.IsRouteKAS(hcp)
 	// Create the Service type LB internal for private endpoints.
 	pubSvc := manifests.RouterPublicService(hcp.Namespace)
 	if util.IsPrivateHCP(hcp) {
@@ -1420,8 +1417,8 @@ func (r *HostedControlPlaneReconciler) reconcileHCPRouterServices(ctx context.Co
 		}
 	}
 
-	// When Public access endpoint we need to create a Service type LB external for the KAS.
-	if util.IsPublicHCP(hcp) && exposeKASThroughRouter {
+	// When Public access endpoint we need to create a Service type LB external.
+	if util.IsPublicWithDNS(hcp) {
 		if _, err := createOrUpdate(ctx, r.Client, pubSvc, func() error {
 			return ingress.ReconcileRouterService(pubSvc, false, util.IsPrivateHCP(hcp), hcp)
 		}); err != nil {
@@ -1532,7 +1529,7 @@ func (r *HostedControlPlaneReconciler) reconcileInternalRouterServiceStatus(ctx 
 }
 
 func (r *HostedControlPlaneReconciler) reconcileExternalRouterServiceStatus(ctx context.Context, hcp *hyperv1.HostedControlPlane) (host string, needed bool, message string, err error) {
-	if !util.IsPublicHCP(hcp) || !util.IsRouteKAS(hcp) || sharedingress.UseSharedIngress() || hcp.Spec.Platform.Type == hyperv1.IBMCloudPlatform {
+	if !util.IsPublicWithDNS(hcp) || sharedingress.UseSharedIngress() || hcp.Spec.Platform.Type == hyperv1.IBMCloudPlatform {
 		return
 	}
 	return r.reconcileRouterServiceStatus(ctx, manifests.RouterPublicService(hcp.Namespace), events.NewMessageCollector(ctx, r.Client))
@@ -2277,6 +2274,22 @@ func (r *HostedControlPlaneReconciler) cleanupOldKonnectivityServerDeployment(ct
 	// Remove the konnectivity-server deployment if it exists
 	if _, err := util.DeleteIfNeeded(ctx, r, serverDeployment); err != nil {
 		return fmt.Errorf("failed to remove konnectivity-server deployment: %w", err)
+	}
+	return nil
+}
+
+func (r *HostedControlPlaneReconciler) cleanupOldPKIOperatorDeployment(ctx context.Context, hcp *hyperv1.HostedControlPlane) error {
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pkioperatorv2.ComponentName,
+			Namespace: hcp.Namespace,
+		},
+	}
+	// Remove the pki-operator deployment if it exists with outdated selector.
+	if _, err := util.DeleteIfNeededWithPredicate(ctx, r, deployment, func(d *appsv1.Deployment) bool {
+		return d.Spec.Selector != nil && d.Spec.Selector.MatchLabels["name"] == "control-plane-pki-operator"
+	}); err != nil {
+		return fmt.Errorf("failed to remove pki-operator deployment: %w", err)
 	}
 	return nil
 }
@@ -3086,8 +3099,7 @@ func awsSecurityGroupTags(hcp *hyperv1.HostedControlPlane) map[string]string {
 		tags["Name"] = awsSecurityGroupName(infraID)
 	}
 
-	if hcp.Spec.AutoNode != nil && hcp.Spec.AutoNode.Provisioner.Name == hyperv1.ProvisionerKarpeneter &&
-		hcp.Spec.AutoNode.Provisioner.Karpenter.Platform == hyperv1.AWSPlatform {
+	if karpenterutil.IsKarpenterEnabled(hcp.Spec.AutoNode) {
 		if _, exist := tags["karpenter.sh/discovery"]; !exist {
 			tags["karpenter.sh/discovery"] = infraID
 		}
@@ -3258,6 +3270,14 @@ func (r *HostedControlPlaneReconciler) validateAWSKMSConfig(ctx context.Context,
 }
 
 func (r *HostedControlPlaneReconciler) validateAzureKMSConfig(ctx context.Context, hcp *hyperv1.HostedControlPlane) {
+	var (
+		cred azcore.TokenCredential
+		ok   bool
+		err  error
+	)
+
+	log := ctrl.LoggerFrom(ctx)
+
 	if hcp.Spec.SecretEncryption == nil || hcp.Spec.SecretEncryption.KMS == nil || hcp.Spec.SecretEncryption.KMS.Azure == nil {
 		condition := metav1.Condition{
 			Type:               string(hyperv1.ValidAzureKMSConfig),
@@ -3271,13 +3291,31 @@ func (r *HostedControlPlaneReconciler) validateAzureKMSConfig(ctx context.Contex
 	}
 	azureKmsSpec := hcp.Spec.SecretEncryption.KMS.Azure
 
-	// Retrieve the KMS UserAssignedCredentials path
-	credentialsPath := config.ManagedAzureCredentialsPathForKMS + hcp.Spec.SecretEncryption.KMS.Azure.KMS.CredentialsSecretName
-	cred, err := dataplane.NewUserAssignedIdentityCredential(ctx, credentialsPath, dataplane.WithClientOpts(azcore.ClientOptions{Cloud: cloud.AzurePublic}))
-	if err != nil {
-		conditions.SetFalseCondition(hcp, hyperv1.ValidAzureKMSConfig, hyperv1.InvalidAzureCredentialsReason,
-			fmt.Sprintf("failed to obtain azure client credentials: %v", err))
-		return
+	if hyperazureutil.IsAroHCP() {
+		key := hcp.Namespace + kmsAzureCredentials
+
+		// We need to only store the Azure credentials once and reuse them after that.
+		storedCreds, found := r.kmsAzureCredentialsLoaded.Load(key)
+		if !found {
+			// Retrieve the KMS UserAssignedCredentials path
+			credentialsPath := config.ManagedAzureCredentialsPathForKMS + hcp.Spec.SecretEncryption.KMS.Azure.KMS.CredentialsSecretName
+			cred, err := dataplane.NewUserAssignedIdentityCredential(ctx, credentialsPath, dataplane.WithClientOpts(azcore.ClientOptions{Cloud: cloud.AzurePublic}))
+			if err != nil {
+				conditions.SetFalseCondition(hcp, hyperv1.ValidAzureKMSConfig, hyperv1.InvalidAzureCredentialsReason,
+					fmt.Sprintf("failed to obtain azure client credentials: %v", err))
+				return
+			}
+			r.kmsAzureCredentialsLoaded.Store(key, cred)
+			log.Info("Storing new UserAssignedManagedIdentity credentials for KMS to authenticate to Azure")
+		} else {
+			cred, ok = storedCreds.(azcore.TokenCredential)
+			if !ok {
+				conditions.SetFalseCondition(hcp, hyperv1.ValidAzureKMSConfig, hyperv1.InvalidAzureCredentialsReason,
+					fmt.Sprintf("expected %T to be a TokenCredential", storedCreds))
+				return
+			}
+			log.Info("Reusing existing UserAssignedManagedIdentity credentials for KMS to authenticate to Azure")
+		}
 	}
 
 	azureKeyVaultDNSSuffix, err := hyperazureutil.GetKeyVaultDNSSuffixFromCloudType(hcp.Spec.Platform.Azure.Cloud)
@@ -3370,11 +3408,11 @@ func (r *HostedControlPlaneReconciler) verifyResourceGroupLocationsMatch(ctx con
 		err       error
 	)
 
-	key := hcp.Namespace + azureCredentials
+	key := hcp.Namespace + cpoAzureCredentials
 	log := ctrl.LoggerFrom(ctx)
 
 	// We need to only store the Azure credentials once and reuse them after that.
-	storedCreds, found := r.azureCredentialsLoaded.Load(key)
+	storedCreds, found := r.cpoAzureCredentialsLoaded.Load(key)
 	if !found {
 		certPath := config.ManagedAzureCertificatePath + hcp.Spec.Platform.Azure.AzureAuthenticationConfig.ManagedIdentities.ControlPlane.ControlPlaneOperator.CredentialsSecretName
 		creds, err = dataplane.NewUserAssignedIdentityCredential(ctx, certPath, dataplane.WithClientOpts(azcore.ClientOptions{Cloud: cloud.AzurePublic}), dataplane.WithLogger(&log))
@@ -3382,13 +3420,14 @@ func (r *HostedControlPlaneReconciler) verifyResourceGroupLocationsMatch(ctx con
 			return fmt.Errorf("failed to create azure creds to verify resource group locations: %v", err)
 		}
 
-		r.azureCredentialsLoaded.Store(key, creds)
-		log.Info("Storing new UserAssignedManagedIdentity credentials to authenticate to Azure")
+		r.cpoAzureCredentialsLoaded.Store(key, creds)
+		log.Info("Storing new UserAssignedManagedIdentity credentials for the CPO to authenticate to Azure")
 	} else {
 		creds, ok = storedCreds.(azcore.TokenCredential)
 		if !ok {
 			return fmt.Errorf("expected %T to be a TokenCredential", storedCreds)
 		}
+		log.Info("Reusing existing UserAssignedManagedIdentity credentials for the CPO to authenticate to Azure")
 	}
 
 	// Retrieve full vnet information from the VNET ID

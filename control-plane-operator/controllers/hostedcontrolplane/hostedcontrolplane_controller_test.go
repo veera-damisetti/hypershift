@@ -163,6 +163,427 @@ func TestReconcileKubeadminPassword(t *testing.T) {
 	}
 }
 
+func TestReconcileIgnitionServer(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	mockedProviderWithOpenshiftImageRegistryOverrides := releaseinfo.NewMockProviderWithOpenShiftImageRegistryOverrides(mockCtrl)
+	mockedProviderWithOpenshiftImageRegistryOverrides.EXPECT().
+		Lookup(gomock.Any(), gomock.Any(), gomock.Any()).Return(testutils.InitReleaseImageOrDie("4.20.0"), nil).AnyTimes()
+	mockedProviderWithOpenshiftImageRegistryOverrides.EXPECT().
+		GetRegistryOverrides().Return(map[string]string{"registry": "override"}).AnyTimes()
+	mockedProviderWithOpenshiftImageRegistryOverrides.EXPECT().
+		GetOpenShiftImageRegistryOverrides().Return(map[string][]string{"registry": {"override"}}).AnyTimes()
+	mockedProviderWithOpenshiftImageRegistryOverrides.EXPECT().GetMirroredReleaseImage().Return("").AnyTimes()
+
+	hcp := &hyperv1.HostedControlPlane{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hcp",
+			Namespace: "hcp-namespace",
+		},
+		Spec: hyperv1.HostedControlPlaneSpec{
+			Configuration: &hyperv1.ClusterConfiguration{
+				FeatureGate: &configv1.FeatureGateSpec{
+					FeatureGateSelection: configv1.FeatureGateSelection{
+						FeatureSet: configv1.Default,
+					},
+				},
+			},
+			Services: []hyperv1.ServicePublishingStrategyMapping{
+				{
+					Service: hyperv1.Ignition,
+					ServicePublishingStrategy: hyperv1.ServicePublishingStrategy{
+						Type: hyperv1.Route,
+					},
+				},
+			},
+			Networking: hyperv1.ClusterNetworking{
+				APIServer: &hyperv1.APIServerNetworking{
+					Port:             ptr.To[int32](2040),
+					AdvertiseAddress: ptr.To("1.2.3.4"),
+				},
+			},
+			Etcd: hyperv1.EtcdSpec{
+				ManagementType: hyperv1.Managed,
+			},
+			Platform: hyperv1.PlatformSpec{
+				Type: hyperv1.IBMCloudPlatform,
+				IBMCloud: &hyperv1.IBMCloudPlatformSpec{
+					ProviderType: configv1.IBMCloudProviderTypeVPC,
+				},
+			},
+		},
+	}
+
+	cpContext := controlplanecomponent.ControlPlaneContext{
+		Context:                  t.Context(),
+		ApplyProvider:            upsert.NewApplyProvider(true),
+		ReleaseImageProvider:     testutil.FakeImageProvider(),
+		UserReleaseImageProvider: testutil.FakeImageProvider(),
+		SkipPredicate:            false,
+		SkipCertificateSigning:   false,
+		HCP:                      hcp,
+	}
+
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		caCert      *corev1.Secret
+		servingCert *corev1.Secret
+	}{
+		{
+			name:        "No certs, no extra annotations",
+			annotations: map[string]string{},
+			caCert:      nil,
+			servingCert: nil,
+		},
+		{
+			name: "Premade certs, DisablePKIReconciliation annotation present",
+			annotations: map[string]string{
+				hyperv1.DisablePKIReconciliationAnnotation: "true",
+			},
+			caCert: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ignition-server-ca-cert",
+					Namespace: "hcp-namespace",
+				},
+				Data: map[string][]byte{
+					corev1.TLSCertKey:       []byte("fake"),
+					corev1.TLSPrivateKeyKey: []byte("fake"),
+				},
+			},
+			servingCert: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ignition-server-serving-cert",
+					Namespace: "hcp-namespace",
+				},
+				Data: map[string][]byte{
+					corev1.TLSCertKey:       []byte("fake"),
+					corev1.TLSPrivateKeyKey: []byte("fake"),
+				},
+			},
+		},
+		{
+			name: "No certs, DisablePKIReconciliation annotation present",
+			annotations: map[string]string{
+				hyperv1.DisablePKIReconciliationAnnotation: "true",
+			},
+			caCert:      nil,
+			servingCert: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hcp.ObjectMeta.Annotations = tt.annotations
+
+			ignitionComponent := ignitionserverv2.NewComponent(mockedProviderWithOpenshiftImageRegistryOverrides, "")
+			fakeObjects, err := componentsFakeObjects(hcp.Namespace, configv1.Default)
+			if err != nil {
+				t.Fatalf("failed to generate fake objects: %v", err)
+			}
+			fakeDeps := componentsFakeDependencies(ignitionComponent.Name(), hcp.Namespace)
+
+			ignitionCerts := []client.Object{}
+			if tt.caCert != nil {
+				ignitionCerts = append(ignitionCerts, tt.caCert)
+			}
+			if tt.servingCert != nil {
+				ignitionCerts = append(ignitionCerts, tt.servingCert)
+			}
+
+			fakeClient := fake.NewClientBuilder().WithScheme(api.Scheme).
+				WithObjects(fakeObjects...).
+				WithObjects(fakeDeps...).
+				WithObjects(ignitionCerts...).
+				Build()
+			cpContext.Client = fakeClient
+
+			if err := ignitionComponent.Reconcile(cpContext); err != nil {
+				t.Fatalf("failed to reconcile: %v", err)
+			}
+
+			gotCACert := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ignition-server-ca-cert",
+					Namespace: "hcp-namespace",
+				},
+			}
+			gotServingCert := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ignition-server-serving-cert",
+					Namespace: "hcp-namespace",
+				},
+			}
+
+			_, hasPKIAnnotation := tt.annotations[hyperv1.DisablePKIReconciliationAnnotation]
+			expectCACert := !hasPKIAnnotation || tt.caCert != nil
+			expectServingCert := !hasPKIAnnotation || tt.servingCert != nil
+
+			err = fakeClient.Get(t.Context(), client.ObjectKeyFromObject(gotCACert), gotCACert)
+			if err != nil && expectCACert {
+				t.Fatalf("ignition-server-ca-cert does not exist")
+			} else if err == nil && !expectCACert {
+				t.Fatalf("ignition-server-ca-cert exists")
+			}
+
+			err = fakeClient.Get(t.Context(), client.ObjectKeyFromObject(gotServingCert), gotServingCert)
+			if err != nil && expectServingCert {
+				t.Fatalf("ignition-server-serving-cert does not exist")
+			} else if err == nil && !expectServingCert {
+				t.Fatalf("ignition-server-serving-cert exists")
+			}
+
+			if tt.caCert != nil {
+				wantKey := string(tt.caCert.Data[corev1.TLSCertKey])
+				gotKey := string(gotCACert.Data[corev1.TLSCertKey])
+				if wantKey != gotKey {
+					t.Fatalf("ignition-server-ca-cert data mismatch: want %v, got %v", wantKey, gotKey)
+				}
+			}
+			if tt.servingCert != nil {
+				wantKey := string(tt.servingCert.Data[corev1.TLSCertKey])
+				gotKey := string(gotServingCert.Data[corev1.TLSCertKey])
+				if wantKey != gotKey {
+					t.Fatalf("ignition-server-serving-cert data mismatch: want %v, got %v", wantKey, gotKey)
+				}
+			}
+		})
+	}
+}
+
+func TestReconcileOAuthService(t *testing.T) {
+	targetNamespace := "test"
+	apiPort := int32(config.KASSVCPort)
+	hostname := "test.example.com"
+	allowCIDR := []hyperv1.CIDRBlock{"1.2.3.4/24"}
+	ipFamilyPolicy := corev1.IPFamilyPolicyPreferDualStack
+
+	ownerRef := metav1.OwnerReference{
+		APIVersion:         "hypershift.openshift.io/v1beta1",
+		Kind:               "HostedControlPlane",
+		Name:               "test",
+		Controller:         ptr.To(true),
+		BlockOwnerDeletion: ptr.To(true),
+	}
+	oauthPublicService := func(m ...func(*corev1.Service)) corev1.Service {
+		svc := corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:       targetNamespace,
+				Name:            manifests.OauthServerService(targetNamespace).Name,
+				OwnerReferences: []metav1.OwnerReference{ownerRef},
+			},
+			Spec: corev1.ServiceSpec{
+				Type:           corev1.ServiceTypeClusterIP,
+				IPFamilyPolicy: &ipFamilyPolicy,
+				Ports: []corev1.ServicePort{
+					{
+						Protocol:   corev1.ProtocolTCP,
+						Port:       apiPort,
+						TargetPort: intstr.FromInt32(apiPort),
+					},
+				},
+				Selector: map[string]string{
+					"app": "oauth-openshift",
+					"hypershift.openshift.io/control-plane-component": "oauth-openshift",
+				},
+			},
+		}
+		for _, m := range m {
+			m(&svc)
+		}
+		return svc
+	}
+	oauthExternalPublicRoute := func(m ...func(*routev1.Route)) routev1.Route {
+		route := routev1.Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: targetNamespace,
+				Name:      "oauth",
+				Labels: map[string]string{
+					"hypershift.openshift.io/hosted-control-plane": targetNamespace,
+				},
+				OwnerReferences: []metav1.OwnerReference{ownerRef},
+			},
+			Spec: routev1.RouteSpec{
+				Host: hostname,
+				To: routev1.RouteTargetReference{
+					Kind: "Service",
+					Name: manifests.OauthServerService("").Name,
+				},
+				TLS: &routev1.TLSConfig{
+					Termination:                   routev1.TLSTerminationPassthrough,
+					InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyNone,
+				},
+			},
+		}
+		for _, m := range m {
+			m(&route)
+		}
+		return route
+	}
+	oauthInternalRoute := routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: targetNamespace,
+			Name:      "oauth-internal",
+			Labels: map[string]string{
+				"hypershift.openshift.io/hosted-control-plane": targetNamespace,
+				"hypershift.openshift.io/internal-route":       "true",
+			},
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
+		},
+		Spec: routev1.RouteSpec{
+			Host: "oauth.apps.test.hypershift.local",
+			To: routev1.RouteTargetReference{
+				Kind: "Service",
+				Name: manifests.OauthServerService("").Name,
+			},
+			TLS: &routev1.TLSConfig{
+				Termination:                   routev1.TLSTerminationPassthrough,
+				InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyNone,
+			},
+		},
+	}
+	testsCases := []struct {
+		name                    string
+		endpointAccess          hyperv1.AWSEndpointAccessType
+		oauthPublishingStrategy hyperv1.ServicePublishingStrategy
+
+		expectedServices []corev1.Service
+		expectedRoutes   []routev1.Route
+	}{
+		{
+			name:           "Route strategy, Public",
+			endpointAccess: hyperv1.Public,
+			oauthPublishingStrategy: hyperv1.ServicePublishingStrategy{
+				Type: hyperv1.Route,
+				Route: &hyperv1.RoutePublishingStrategy{
+					Hostname: hostname,
+				},
+			},
+			expectedServices: []corev1.Service{
+				oauthPublicService(func(s *corev1.Service) {
+					s.Spec.Type = corev1.ServiceTypeClusterIP
+				}),
+			},
+			expectedRoutes: []routev1.Route{
+				oauthExternalPublicRoute(),
+			},
+		},
+		{
+			name:           "Route strategy, PublicPrivate",
+			endpointAccess: hyperv1.PublicAndPrivate,
+			oauthPublishingStrategy: hyperv1.ServicePublishingStrategy{
+				Type: hyperv1.Route,
+				Route: &hyperv1.RoutePublishingStrategy{
+					Hostname: hostname,
+				},
+			},
+
+			expectedServices: []corev1.Service{
+				oauthPublicService(func(s *corev1.Service) {
+					s.Spec.Type = corev1.ServiceTypeClusterIP
+				}),
+			},
+			expectedRoutes: []routev1.Route{
+				oauthExternalPublicRoute(),
+				oauthInternalRoute,
+			},
+		},
+		{
+			name:           "Route strategy, PublicPrivate, no hostname",
+			endpointAccess: hyperv1.PublicAndPrivate,
+			oauthPublishingStrategy: hyperv1.ServicePublishingStrategy{
+				Type: hyperv1.Route,
+			},
+
+			expectedServices: []corev1.Service{
+				oauthPublicService(func(s *corev1.Service) {
+					s.Spec.Type = corev1.ServiceTypeClusterIP
+				}),
+			},
+			expectedRoutes: []routev1.Route{
+				oauthExternalPublicRoute(func(s *routev1.Route) {
+					s.Spec.Host = ""
+					// The route should not be admitted by the private router.
+					delete(s.Labels, "hypershift.openshift.io/hosted-control-plane")
+				}),
+				oauthInternalRoute,
+			},
+		},
+		{
+			name:           "Route strategy, Private",
+			endpointAccess: hyperv1.Private,
+			oauthPublishingStrategy: hyperv1.ServicePublishingStrategy{
+				Type:  hyperv1.Route,
+				Route: &hyperv1.RoutePublishingStrategy{},
+			},
+			expectedServices: []corev1.Service{
+				oauthPublicService(func(s *corev1.Service) {
+					s.Spec.Type = corev1.ServiceTypeClusterIP
+				}),
+			},
+			expectedRoutes: []routev1.Route{
+				oauthInternalRoute,
+			},
+		},
+	}
+	for _, tc := range testsCases {
+		t.Run(tc.name, func(t *testing.T) {
+			hcp := &hyperv1.HostedControlPlane{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: targetNamespace,
+					Name:      "test",
+				},
+				Spec: hyperv1.HostedControlPlaneSpec{
+					Networking: hyperv1.ClusterNetworking{
+						APIServer: &hyperv1.APIServerNetworking{
+							Port:              &apiPort,
+							AllowedCIDRBlocks: allowCIDR,
+						},
+					},
+					Platform: hyperv1.PlatformSpec{
+						Type: hyperv1.AWSPlatform,
+						AWS: &hyperv1.AWSPlatformSpec{
+							EndpointAccess: tc.endpointAccess,
+						},
+					},
+					Services: []hyperv1.ServicePublishingStrategyMapping{{
+						Service:                   hyperv1.OAuthServer,
+						ServicePublishingStrategy: tc.oauthPublishingStrategy,
+					}},
+				},
+			}
+
+			ctx := ctrl.LoggerInto(context.Background(), zapr.NewLogger(zaptest.NewLogger(t)))
+
+			fakeClient := fake.NewClientBuilder().WithScheme(api.Scheme).Build()
+			r := &HostedControlPlaneReconciler{
+				Client: fakeClient,
+				Log:    ctrl.LoggerFrom(ctx),
+			}
+
+			if err := r.reconcileOAuthServerService(ctx, hcp, controllerutil.CreateOrUpdate); err != nil {
+				t.Fatalf("reconcileOAuthServerService failed: %v", err)
+			}
+
+			var actualServices corev1.ServiceList
+			if err := fakeClient.List(ctx, &actualServices); err != nil {
+				t.Fatalf("failed to list services: %v", err)
+			}
+
+			if diff := testutil.MarshalYamlAndDiff(&actualServices, &corev1.ServiceList{Items: tc.expectedServices}, t); diff != "" {
+				t.Errorf("actual services differ from expected: %s", diff)
+			}
+
+			var actualRoutes routev1.RouteList
+			if err := fakeClient.List(ctx, &actualRoutes); err != nil {
+				t.Fatalf("failed to list routes: %v", err)
+			}
+			if diff := testutil.MarshalYamlAndDiff(&actualRoutes, &routev1.RouteList{Items: tc.expectedRoutes}, t); diff != "" {
+				t.Errorf("actual routes differ from expected: %s", diff)
+			}
+		})
+	}
+}
+
 func TestReconcileAPIServerService(t *testing.T) {
 	targetNamespace := "test"
 	apiPort := int32(config.KASSVCPort)
@@ -1354,94 +1775,134 @@ func TestControlPlaneComponents(t *testing.T) {
 	mockedProviderWithOpenshiftImageRegistryOverrides.EXPECT().
 		Lookup(gomock.Any(), gomock.Any(), gomock.Any()).Return(testutils.InitReleaseImageOrDie("4.15.0"), nil).AnyTimes()
 	mockedProviderWithOpenshiftImageRegistryOverrides.EXPECT().
-		GetRegistryOverrides().Return(nil).AnyTimes()
+		GetRegistryOverrides().Return(map[string]string{"registry": "override"}).AnyTimes()
 	mockedProviderWithOpenshiftImageRegistryOverrides.EXPECT().
-		GetOpenShiftImageRegistryOverrides().Return(nil).AnyTimes()
+		GetOpenShiftImageRegistryOverrides().Return(map[string][]string{"registry": {"override"}}).AnyTimes()
 	mockedProviderWithOpenshiftImageRegistryOverrides.EXPECT().GetMirroredReleaseImage().Return("").AnyTimes()
 
-	reconciler := &HostedControlPlaneReconciler{
-		ReleaseProvider:               mockedProviderWithOpenshiftImageRegistryOverrides,
-		ManagementClusterCapabilities: &fakecapabilities.FakeSupportAllCapabilities{},
+	tests := []struct {
+		name         string
+		featureSet   configv1.FeatureSet
+		platformType *hyperv1.PlatformType
+	}{
+		{
+			name:         "Default feature set, default platform type",
+			featureSet:   configv1.Default,
+			platformType: nil,
+		},
+		{
+			name:         "TechPreviewNoUpgrade feature set, default platform type",
+			featureSet:   configv1.TechPreviewNoUpgrade,
+			platformType: nil,
+		},
+		{
+			name:         "Default feature set, IBM Cloud platform type",
+			featureSet:   configv1.Default,
+			platformType: ptr.To(hyperv1.IBMCloudPlatform),
+		},
 	}
 
-	hcp := &hyperv1.HostedControlPlane{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "hcp",
-			Namespace: "hcp-namespace",
-			Labels: map[string]string{
-				"cluster.x-k8s.io/cluster-name": "cluster_name",
-			},
-		},
-		Spec: hyperv1.HostedControlPlaneSpec{
-			Configuration: &hyperv1.ClusterConfiguration{
-				FeatureGate: &configv1.FeatureGateSpec{},
-			},
-			Services: []hyperv1.ServicePublishingStrategyMapping{
-				{
-					Service: hyperv1.Ignition,
-					ServicePublishingStrategy: hyperv1.ServicePublishingStrategy{
-						Type: hyperv1.Route,
-					},
+	for _, tt := range tests {
+		reconciler := &HostedControlPlaneReconciler{
+			ReleaseProvider:               mockedProviderWithOpenshiftImageRegistryOverrides,
+			ManagementClusterCapabilities: &fakecapabilities.FakeSupportAllCapabilities{},
+		}
+		hcp := &hyperv1.HostedControlPlane{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "hcp",
+				Namespace: "hcp-namespace",
+				Labels: map[string]string{
+					"cluster.x-k8s.io/cluster-name": "cluster_name",
 				},
 			},
-			Networking: hyperv1.ClusterNetworking{
-				ClusterNetwork: []hyperv1.ClusterNetworkEntry{
+			Spec: hyperv1.HostedControlPlaneSpec{
+				Configuration: &hyperv1.ClusterConfiguration{
+					FeatureGate: &configv1.FeatureGateSpec{},
+				},
+				Services: []hyperv1.ServicePublishingStrategyMapping{
 					{
-						CIDR: *ipnet.MustParseCIDR("10.132.0.0/14"),
+						Service: hyperv1.Ignition,
+						ServicePublishingStrategy: hyperv1.ServicePublishingStrategy{
+							Type: hyperv1.Route,
+						},
 					},
 				},
-			},
-			Etcd: hyperv1.EtcdSpec{
-				ManagementType: hyperv1.Managed,
-			},
-			Platform: hyperv1.PlatformSpec{
-				Type: hyperv1.AWSPlatform,
-				AWS:  &hyperv1.AWSPlatformSpec{},
-				Azure: &hyperv1.AzurePlatformSpec{
-					SubnetID:        "/subscriptions/mySubscriptionID/resourceGroups/myResourceGroupName/providers/Microsoft.Network/virtualNetworks/myVnetName/subnets/mySubnetName",
-					SecurityGroupID: "/subscriptions/mySubscriptionID/resourceGroups/myResourceGroupName/providers/Microsoft.Network/networkSecurityGroups/myNSGName",
-					VnetID:          "/subscriptions/mySubscriptionID/resourceGroups/myResourceGroupName/providers/Microsoft.Network/virtualNetworks/myVnetName",
-				},
-				OpenStack: &hyperv1.OpenStackPlatformSpec{
-					IdentityRef: hyperv1.OpenStackIdentityReference{
-						Name: "fake-cloud-credentials-secret",
+				Networking: hyperv1.ClusterNetworking{
+					ClusterNetwork: []hyperv1.ClusterNetworkEntry{
+						{
+							CIDR: *ipnet.MustParseCIDR("10.132.0.0/14"),
+						},
 					},
 				},
-				PowerVS: &hyperv1.PowerVSPlatformSpec{
-					VPC: &hyperv1.PowerVSVPC{},
+				Etcd: hyperv1.EtcdSpec{
+					ManagementType: hyperv1.Managed,
 				},
+				Platform: hyperv1.PlatformSpec{
+					Type: hyperv1.AWSPlatform,
+					AWS:  &hyperv1.AWSPlatformSpec{},
+					Azure: &hyperv1.AzurePlatformSpec{
+						SubnetID:        "/subscriptions/mySubscriptionID/resourceGroups/myResourceGroupName/providers/Microsoft.Network/virtualNetworks/myVnetName/subnets/mySubnetName",
+						SecurityGroupID: "/subscriptions/mySubscriptionID/resourceGroups/myResourceGroupName/providers/Microsoft.Network/networkSecurityGroups/myNSGName",
+						VnetID:          "/subscriptions/mySubscriptionID/resourceGroups/myResourceGroupName/providers/Microsoft.Network/virtualNetworks/myVnetName",
+						AzureAuthenticationConfig: hyperv1.AzureAuthenticationConfiguration{
+							AzureAuthenticationConfigType: hyperv1.AzureAuthenticationTypeWorkloadIdentities,
+							WorkloadIdentities: &hyperv1.AzureWorkloadIdentities{
+								CloudProvider: hyperv1.WorkloadIdentity{ClientID: hyperv1.AzureClientID("myClientID")},
+							},
+						},
+					},
+					OpenStack: &hyperv1.OpenStackPlatformSpec{
+						IdentityRef: hyperv1.OpenStackIdentityReference{
+							Name: "fake-cloud-credentials-secret",
+						},
+					},
+					PowerVS: &hyperv1.PowerVSPlatformSpec{
+						VPC: &hyperv1.PowerVSVPC{},
+					},
+					IBMCloud: &hyperv1.IBMCloudPlatformSpec{
+						ProviderType: configv1.IBMCloudProviderTypeVPC,
+					},
+				},
+				ReleaseImage: "quay.io/openshift-release-dev/ocp-release:4.16.10-x86_64",
 			},
-			ReleaseImage: "quay.io/openshift-release-dev/ocp-release:4.16.10-x86_64",
-		},
-	}
+		}
+		if tt.platformType != nil {
+			hcp.Spec.Platform.Type = *tt.platformType
+			if *tt.platformType == hyperv1.IBMCloudPlatform {
+				hcp.Spec.Networking.APIServer = &hyperv1.APIServerNetworking{
+					Port:             ptr.To[int32](2040),
+					AdvertiseAddress: ptr.To("1.2.3.4"),
+				}
+			}
+		}
 
-	reconciler.registerComponents(hcp)
+		reconciler.registerComponents(hcp)
 
-	cpContext := controlplanecomponent.ControlPlaneContext{
-		Context:                  t.Context(),
-		ReleaseImageProvider:     testutil.FakeImageProvider(),
-		UserReleaseImageProvider: testutil.FakeImageProvider(),
-		ImageMetadataProvider: &fakeimagemetadataprovider.FakeRegistryClientImageMetadataProvider{
-			Result: &dockerv1client.DockerImageConfig{
-				Config: &docker10.DockerConfig{
-					Labels: map[string]string{
-						"io.openshift.release": "4.16.10",
+		cpContext := controlplanecomponent.ControlPlaneContext{
+			Context:                  t.Context(),
+			ReleaseImageProvider:     testutil.FakeImageProvider(),
+			UserReleaseImageProvider: testutil.FakeImageProvider(),
+			ImageMetadataProvider: &fakeimagemetadataprovider.FakeRegistryClientImageMetadataProvider{
+				Result: &dockerv1client.DockerImageConfig{
+					Config: &docker10.DockerConfig{
+						Labels: map[string]string{
+							"io.openshift.release": "4.16.10",
+						},
 					},
 				},
+				Manifest: fakeimagemetadataprovider.FakeManifest{},
 			},
-			Manifest: fakeimagemetadataprovider.FakeManifest{},
-		},
-		HCP:                    hcp,
-		SkipPredicate:          true,
-		SkipCertificateSigning: true,
-	}
-	for _, featureSet := range []configv1.FeatureSet{configv1.Default, configv1.TechPreviewNoUpgrade} {
-		cpContext.HCP.Spec.Configuration.FeatureGate.FeatureGateSelection.FeatureSet = featureSet
+			HCP:                    hcp,
+			SkipPredicate:          true,
+			SkipCertificateSigning: true,
+		}
+
+		cpContext.HCP.Spec.Configuration.FeatureGate.FeatureGateSelection.FeatureSet = tt.featureSet
 		// This needs to be defined here, to avoid loopDetector reporting a no-op update, as changing the featureset will actually cause an update.
 		cpContext.ApplyProvider = upsert.NewApplyProvider(true)
 
 		for _, component := range reconciler.components {
-			fakeObjects, err := componentsFakeObjects(hcp.Namespace, featureSet)
+			fakeObjects, err := componentsFakeObjects(hcp.Namespace, tt.featureSet)
 			if err != nil {
 				t.Fatalf("failed to generate fake objects: %v", err)
 			}
@@ -1492,8 +1953,11 @@ func TestControlPlaneComponents(t *testing.T) {
 
 				suffix := fmt.Sprintf("_%s_%s", obj.GetName(), strings.ToLower(kind))
 				subDir := component.Name()
-				if featureSet != configv1.Default {
-					subDir = fmt.Sprintf("%s/%s", component.Name(), featureSet)
+				if tt.featureSet != configv1.Default {
+					subDir = fmt.Sprintf("%s/%s", component.Name(), tt.featureSet)
+				}
+				if tt.platformType != nil {
+					subDir = fmt.Sprintf("%s/%s", component.Name(), *tt.platformType)
 				}
 				testutil.CompareWithFixture(t, yaml, testutil.WithSubDir(subDir), testutil.WithSuffix(suffix))
 			}
@@ -1504,7 +1968,6 @@ func TestControlPlaneComponents(t *testing.T) {
 			t.Fatalf("update loop detected: %v", err)
 		}
 	}
-
 }
 
 func TestAWSSecurityGroupTags(t *testing.T) {
@@ -1562,7 +2025,7 @@ func TestAWSSecurityGroupTags(t *testing.T) {
 					},
 					AutoNode: &hyperv1.AutoNode{
 						Provisioner: &hyperv1.ProvisionerConfig{
-							Name: hyperv1.ProvisionerKarpeneter,
+							Name: hyperv1.ProvisionerKarpenter,
 							Karpenter: &hyperv1.KarpenterConfig{
 								Platform: hyperv1.AWSPlatform,
 							},

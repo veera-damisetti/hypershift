@@ -116,6 +116,29 @@ func DeleteIfNeededWithOptions(ctx context.Context, c client.Client, o client.Ob
 	return true, nil
 }
 
+func DeleteIfNeededWithPredicate[T client.Object](ctx context.Context, c client.Client, o T, predicate func(T) bool) (exists bool, err error) {
+	if err := c.Get(ctx, client.ObjectKeyFromObject(o), o); err != nil {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("error getting %T: %w", o, err)
+	}
+	if o.GetDeletionTimestamp() != nil {
+		return true, nil
+	}
+	if !predicate(o) {
+		return true, nil
+	}
+	if err := c.Delete(ctx, o); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("error deleting %T: %w", o, err)
+	}
+
+	return true, nil
+}
+
 func DeleteIfNeeded(ctx context.Context, c client.Client, o client.Object) (exists bool, err error) {
 	return DeleteIfNeededWithOptions(ctx, c, o)
 }
@@ -357,6 +380,11 @@ func ConvertImageRegistryOverrideStringToMap(envVar string) map[string][]string 
 		registry := registryMirror[0]
 		mirror := registryMirror[1]
 
+		// Skip empty registry or mirror entries
+		if registry == "" || mirror == "" {
+			continue
+		}
+
 		imageRegistryOverrides[registry] = append(imageRegistryOverrides[registry], mirror)
 	}
 
@@ -416,19 +444,6 @@ func ParseNodeSelector(str string) map[string]string {
 		result[kv[0]] = kv[1]
 	}
 	return result
-}
-
-func ApplyAWSLoadBalancerSubnetsAnnotation(svc *corev1.Service, hcp *hyperv1.HostedControlPlane) {
-	if hcp.Spec.Platform.Type != hyperv1.AWSPlatform {
-		return
-	}
-	if svc.Annotations == nil {
-		svc.Annotations = make(map[string]string)
-	}
-	subnets, ok := hcp.Annotations[hyperv1.AWSLoadBalancerSubnetsAnnotation]
-	if ok {
-		svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-subnets"] = subnets
-	}
 }
 
 func ApplyAWSLoadBalancerTargetNodesAnnotation(svc *corev1.Service, hcp *hyperv1.HostedControlPlane) {
